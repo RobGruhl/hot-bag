@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+#
+# hot-bag — keep an Apple Silicon Mac running an unattended job while the lid is
+# closed and it's stowed in a backpack (a.k.a. "hot bagging"): hold the machine
+# awake (hard clamshell override), work over whatever internet you have (iPhone
+# USB tether, Android USB tether, or Wi-Fi hotspot — transparent, no hard
+# requirement on any one), run fine on battery or a USB-C power bank, and log
+# temperature + battery + connectivity every 30s for a full report on stop.
+#
+#   hot-bag start    verify internet, disable clamshell sleep, start watchdog
+#   hot-bag stop     restore sleep, stop watchdog, print the run report
+#   hot-bag status   show a live one-shot reading
+#   hot-bag report   print the report for the latest (or a given) run
+#   hot-bag _watch    (internal) the background sampling loop
+#
+# The ONE manual step no command can do for you: turn the tether ON.
+#   - USB tether:  plug the phone in, enable Personal Hotspot / USB tethering.
+#   - Wi-Fi tether: join the phone's hotspot once (or set WIFI_SSID below).
+#
+set -euo pipefail
+
+# ── configuration (override via env or ~/.config/hot-bag/config) ────────────
+HOTBAG_HOME="${HOTBAG_HOME:-$HOME/.local/state/hot-bag}"
+RUNS_DIR="$HOTBAG_HOME/runs"
+PIDFILE_WATCH="$HOTBAG_HOME/watchdog.pid"
+PIDFILE_CAFF="$HOTBAG_HOME/caffeinate.pid"
+CURRENT_RUN="$HOTBAG_HOME/current-run"      # holds path to the active CSV
+LOCKDIR="$HOTBAG_HOME/.lock"                # prevents overlapping start/stop
+SLEEP_GUARD="$HOTBAG_HOME/disablesleep.on"  # marker that we set disablesleep=1
+
+INTERVAL="${INTERVAL:-30}"                   # seconds between samples
+WARN_C="${WARN_C:-80}"                        # °C: start paying attention
+HOT_C="${HOT_C:-90}"                          # °C: getting uncomfortable
+CRIT_C="${CRIT_C:-95}"                         # °C: too hot — open the bag
+PING_HOST="${PING_HOST:-1.1.1.1}"
+
+# Optional Wi-Fi fallback: if the link drops and these are set, the watchdog
+# will try to rejoin this hotspot. Leave blank to disable.
+WIFI_SSID="${WIFI_SSID:-}"
+WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+
+# Optional low-battery safety: 'sleep' lets the Mac sleep (state preserved) when
+# on battery below LOW_BATT_PCT, instead of risking a hard power-off. 'none' just
+# logs/warns. Default none — we don't want to pause your job uninvited.
+LOW_BATT_ACTION="${LOW_BATT_ACTION:-none}"
+LOW_BATT_PCT="${LOW_BATT_PCT:-7}"
+
+[ -f "$HOME/.config/hot-bag/config" ] && . "$HOME/.config/hot-bag/config"
+
+# Validate numeric config — these all get used in arithmetic ($((...))) or
+# integer comparisons. A bad value here would otherwise blow up the watchdog
+# at an arbitrary later moment.
+for _v in INTERVAL WARN_C HOT_C CRIT_C LOW_BATT_PCT; do
+  case "${!_v}" in
+    ''|*[!0-9]*) printf '\033[1;31m✗\033[0m Invalid %s=%s — must be a positive integer\n' "$_v" "${!_v}" >&2; exit 2 ;;
+    0)           printf '\033[1;31m✗\033[0m Invalid %s=0 — must be greater than zero\n'    "$_v"          >&2; exit 2 ;;
+  esac
+done
+unset _v
+
+mkdir -p "$RUNS_DIR"
+
+# ── pretty output ───────────────────────────────────────────────────────────
+log()  { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
+err()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; }
+
+# ── concurrency + PID safety ────────────────────────────────────────────────
+acquire_lock() {
+  mkdir "$LOCKDIR" 2>/dev/null || { err "Another hot-bag command appears to be running (lock held at $LOCKDIR). If you're sure none is, remove that directory."; exit 1; }
+}
+release_lock() { rmdir "$LOCKDIR" 2>/dev/null || true; }
+# kill -0 only proves a PID exists; this proves it's actually ours.
+safe_ps_match() { local pid="$1" pat="$2"; ps -o command= -p "$pid" 2>/dev/null | grep -q -- "$pat"; }
+
+# ── telemetry readers (all sudo-free, so the watchdog never needs a password) ─
+read_cpu_c() { # real °C via smctemp; NA if unavailable/invalid
+  command -v smctemp >/dev/null 2>&1 || { echo NA; return; }
+  local v; v="$(smctemp -c -i25 -n40 2>/dev/null | tr -dc '0-9.')"
+  awk -v x="$v" 'BEGIN{exit !(x+0>0)}' && echo "$v" || echo NA
+}
+read_gpu_c() {
+  command -v smctemp >/dev/null 2>&1 || { echo NA; return; }
+  local v; v="$(smctemp -g -i25 -n40 2>/dev/null | tr -dc '0-9.')"
+  awk -v x="$v" 'BEGIN{exit !(x+0>0)}' && echo "$v" || echo NA
+}
+read_speed_limit() { # <100 means the OS is throttling (heat or power starvation)
+  local v; v="$(pmset -g therm 2>/dev/null | awk -F= '/CPU_Speed_Limit/{gsub(/[^0-9]/,"",$2);print $2}')"
+  echo "${v:-100}"
+}
+read_batt_pct()  { pmset -g batt 2>/dev/null | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+read_power_src() { pmset -g batt 2>/dev/null | awk -F\' 'NR==1{print $2}'; }  # AC Power / Battery Power
+read_net_iface() { route -n get default 2>/dev/null | awk '/interface:/{print $2}'; }
+net_up() { ping -c1 -t3 "$PING_HOST" >/dev/null 2>&1; }
+# Cumulative rx/tx bytes for an interface (since it came up). Echoes "rx tx".
+# Looks up the Ibytes/Obytes columns by name in the header so we don't break
+# when macOS shifts netstat's column positions between releases.
+read_iface_bytes() {
+  local dev="$1"; [ -z "$dev" ] && { echo "0 0"; return; }
+  local out
+  out="$(netstat -ibnI "$dev" 2>/dev/null | awk '
+    NR==1 { for (i=1;i<=NF;i++) { if ($i=="Ibytes") ib=i; if ($i=="Obytes") ob=i } }
+    /<Link/ && ib && ob { print $ib " " $ob; exit }
+  ')"
+  echo "${out:-0 0}"
+}
+# Humanize a byte count, e.g. 2202010 -> "2.1 MB".
+human_bytes() { awk -v b="${1:-0}" 'BEGIN{nn=split("B KB MB GB TB",u," ");i=1;while(b>=1024&&i<nn){b/=1024;i++}printf "%.1f %s",b,u[i]}'; }
+# Data used over a run's CSV (per-interface delta, summed). Echoes "totrx tottx".
+# Optional live sample (dev rx tx) is folded in to extend the delta to "now".
+run_data_used() { # args: csv [dev rx tx]
+  awk -F, -v ld="${2:-}" -v lr="${3:-0}" -v lt="${4:-0}" '
+    NR>1{
+      if($11+0>0){if(!($9 in rxlo)||$11+0<rxlo[$9])rxlo[$9]=$11+0; if($11+0>rxhi[$9])rxhi[$9]=$11+0}
+      if($12+0>0){if(!($9 in txlo)||$12+0<txlo[$9])txlo[$9]=$12+0; if($12+0>txhi[$9])txhi[$9]=$12+0}
+    }
+    END{
+      if(ld!="" && lr+0>0){
+        if(!(ld in rxlo)||lr+0<rxlo[ld])rxlo[ld]=lr+0; if(lr+0>rxhi[ld])rxhi[ld]=lr+0;
+        if(!(ld in txlo)||lt+0<txlo[ld])txlo[ld]=lt+0; if(lt+0>txhi[ld])txhi[ld]=lt+0;
+      }
+      for(i in rxhi)totrx+=rxhi[i]-rxlo[i];
+      for(i in txhi)tottx+=txhi[i]-txlo[i];
+      print totrx" "tottx;
+    }' "$1"
+}
+
+wifi_dev()       { networksetup -listallhardwareports 2>/dev/null | awk '/Wi-Fi|AirPort/{getline;print $2}'; }
+iphone_usb_dev() { networksetup -listallhardwareports 2>/dev/null | awk '/iPhone USB/{getline;print $2}'; }
+
+# Human label for the active link, e.g. "en6 (iPhone USB)" or "en0 (Wi-Fi)".
+iface_label() {
+  local dev="$1" line
+  [ -z "$dev" ] && { echo "none"; return; }
+  line="$(networksetup -listallhardwareports 2>/dev/null \
+          | awk -v d="$dev" 'BEGIN{RS=""} $0 ~ ("Device: " d "($|\n)") {print}' \
+          | awk -F': ' '/Hardware Port/{print $2; exit}')"
+  echo "$dev (${line:-link})"
+}
+
+# Derive a state label from the hottest sensor + throttle flag.
+thermal_state() { # args: cpu gpu speedlimit
+  awk -v c="$1" -v g="$2" -v sl="$3" -v w="$WARN_C" -v h="$HOT_C" -v cr="$CRIT_C" 'BEGIN{
+    # If we have no temperature data at all, do NOT claim OK — this is a
+    # thermal-safety tool and a false "OK" is the worst kind of lie. The
+    # throttle signal is still meaningful on its own, so surface that.
+    if (c=="NA" && g=="NA") {
+      print (sl+0<100 ? "THROTTLED" : "UNKNOWN");
+      exit;
+    }
+    m=0; if(c!="NA"&&c+0>m)m=c+0; if(g!="NA"&&g+0>m)m=g+0;
+    s="OK";
+    if(m>=w)s="WARM"; if(m>=h)s="HOT"; if(m>=cr)s="CRITICAL";
+    if(sl+0<100 && s=="OK")s="THROTTLED";
+    print s;
+  }'
+}
+
+# ── the background watchdog ─────────────────────────────────────────────────
+_watch() {
+  local logf="$1"
+  # CSV header
+  echo "epoch,iso,cpu_c,gpu_c,state,cpu_speed_limit,battery_pct,power_source,net_iface,net_status,rx_bytes,tx_bytes" > "$logf"
+  local low_batt_tripped=0
+  # Disable strict mode for the sampling loop. Telemetry sources are flaky on
+  # purpose (network interface vanishes during failover, smctemp returns 0,
+  # pmset output shifts) and a missed sample is far better than a dead
+  # watchdog. Every reader below already has a fallback string ("NA", "0 0",
+  # "100", empty); set +e just stops the first transient failure from
+  # killing the whole logger.
+  set +eo pipefail
+  while :; do
+    local epoch iso cpu gpu sl batt psrc dev nstat state rxtx rx tx
+    epoch="$(date +%s)"; iso="$(date '+%Y-%m-%dT%H:%M:%S')"
+    cpu="$(read_cpu_c)"; gpu="$(read_gpu_c)"; sl="$(read_speed_limit)"
+    batt="$(read_batt_pct)"; psrc="$(read_power_src)"; dev="$(read_net_iface)"
+    rxtx="$(read_iface_bytes "$dev")"; rx="${rxtx% *}"; tx="${rxtx#* }"
+    if net_up; then nstat="up"; else nstat="down"; fi
+    state="$(thermal_state "$cpu" "$gpu" "$sl")"
+    echo "$epoch,$iso,$cpu,$gpu,$state,$sl,${batt:-NA},${psrc:-NA},${dev:-none},$nstat,${rx:-0},${tx:-0}" >> "$logf"
+
+    # Resilience: try to rejoin Wi-Fi if the link is down and a fallback is set.
+    # Rate-limit to roughly once every 10 samples to avoid hammering networksetup
+    # (and flapping the Wi-Fi device) when the hotspot is genuinely off.
+    if [ "$nstat" = "down" ] && [ -n "$WIFI_SSID" ] \
+       && [ $((epoch % (INTERVAL * 10))) -lt "$INTERVAL" ]; then
+      local wd; wd="$(wifi_dev)"
+      [ -n "$wd" ] && networksetup -setairportnetwork "$wd" "$WIFI_SSID" "$WIFI_PASSWORD" >/dev/null 2>&1 || true
+    fi
+
+    # Resilience: optional graceful sleep before the battery dies hard.
+    if [ "$LOW_BATT_ACTION" = "sleep" ] && [ "$psrc" = "Battery Power" ] \
+       && [ "${batt:-100}" -le "$LOW_BATT_PCT" ] && [ "$low_batt_tripped" -eq 0 ]; then
+      low_batt_tripped=1
+      sudo -n pmset -a disablesleep 0 >/dev/null 2>&1 || true   # let it sleep gracefully
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+# ── start ───────────────────────────────────────────────────────────────────
+start() {
+  acquire_lock
+  # If we abort after flipping disablesleep=1 but before successful handoff,
+  # restore normal sleep so the user's Mac isn't stranded awake on lid close.
+  local need_cleanup=0
+  trap '
+    if [ "$need_cleanup" = 1 ]; then
+      warn "start aborted — restoring normal sleep"
+      sudo pmset -a disablesleep 0 >/dev/null 2>&1 || err "Could not restore sleep. Run: sudo pmset -a disablesleep 0"
+      rm -f "$SLEEP_GUARD"
+    fi
+    release_lock
+  ' INT TERM HUP EXIT
+
+  if [ -f "$PIDFILE_WATCH" ] && kill -0 "$(cat "$PIDFILE_WATCH")" 2>/dev/null \
+     && safe_ps_match "$(cat "$PIDFILE_WATCH")" "hot-bag _watch"; then
+    err "Already hot bagging (watchdog pid $(cat "$PIDFILE_WATCH")). Run 'hot-bag stop' first."
+    exit 1
+  fi
+
+  log "Checking for internet over any link (USB tether / Wi-Fi / Ethernet)…"
+  local dev tries=0
+  while ! net_up && [ $tries -lt 15 ]; do sleep 2; tries=$((tries+1)); done
+  if ! net_up; then
+    err "No internet reachable."
+    err "Turn the tether ON: plug the phone in + enable Personal Hotspot / USB tethering,"
+    err "or join the phone's Wi-Fi hotspot, then rerun 'hot-bag start'."
+    exit 1
+  fi
+  dev="$(read_net_iface)"
+  ok "Online via $(iface_label "$dev")"
+  warn "macOS routes through whatever link is up; if you have USB tether AND Wi-Fi,"
+  warn "it fails over between them on its own. We just log which one is live."
+
+  local cpu gpu batt psrc
+  cpu="$(read_cpu_c)"; gpu="$(read_gpu_c)"; batt="$(read_batt_pct)"; psrc="$(read_power_src)"
+  ok "Baseline — CPU ${cpu}°C  GPU ${gpu}°C  •  battery ${batt}% on ${psrc}"
+
+  if ! command -v smctemp >/dev/null 2>&1; then
+    warn "smctemp is not installed — temperatures will log as NA and the thermal state will read UNKNOWN."
+    warn "For real °C, stop and install it first:  brew tap narugit/tap && brew install smctemp"
+  fi
+
+  log "Disabling clamshell (lid-closed) sleep — needs sudo…"
+  sudo pmset -a disablesleep 1
+  : > "$SLEEP_GUARD"
+  need_cleanup=1
+  ok "Clamshell sleep disabled — the lid can be closed without sleeping (works on battery too)"
+
+  # launch the watchdog detached; it inherits our config via env
+  local logf="$RUNS_DIR/run-$(date '+%Y%m%d-%H%M%S').csv"
+  echo "$logf" > "$CURRENT_RUN"
+  INTERVAL="$INTERVAL" WARN_C="$WARN_C" HOT_C="$HOT_C" CRIT_C="$CRIT_C" \
+  PING_HOST="$PING_HOST" WIFI_SSID="$WIFI_SSID" WIFI_PASSWORD="$WIFI_PASSWORD" \
+  LOW_BATT_ACTION="$LOW_BATT_ACTION" LOW_BATT_PCT="$LOW_BATT_PCT" \
+    nohup "$0" _watch "$logf" >/dev/null 2>&1 &
+  local wpid=$!
+  echo "$wpid" > "$PIDFILE_WATCH"
+
+  # belt-and-suspenders idle-sleep block, lifecycled to the watchdog so a
+  # second start can't orphan it: -w makes caffeinate exit when wpid dies.
+  caffeinate -dimsu -w "$wpid" & echo $! > "$PIDFILE_CAFF"
+  ok "caffeinate holding (pid $(cat "$PIDFILE_CAFF"))"
+  ok "Watchdog logging every ${INTERVAL}s → $logf"
+
+  echo
+  ok "Ready — close the lid and pack it. Happy hot bagging. 🎒🔥"
+  warn "THERMAL: lid closed in a zipped bag = no airflow. Leave the bag open and don't"
+  warn "         bury the laptop. Watch for HOT/CRITICAL in the report."
+  warn "POWER:   on battery it still runs but drains fast; keep the power bank plugged in."
+  echo
+  log "When the job's done:  hot-bag stop"
+
+  # success — disarm the abort trap; the override should persist until stop.
+  need_cleanup=0
+  trap - INT TERM HUP EXIT
+  release_lock
+}
+
+# ── stop ────────────────────────────────────────────────────────────────────
+stop() {
+  acquire_lock
+  trap 'release_lock' EXIT
+  local restored=0
+  log "Restoring normal sleep behavior — needs sudo…"
+  # Do NOT let a sudo failure abort us here — leaving disablesleep=1 is the
+  # worst possible outcome. Try, surface the error loudly, keep cleaning up.
+  if sudo pmset -a disablesleep 0; then
+    restored=1
+    rm -f "$SLEEP_GUARD"
+    ok "Clamshell sleep re-enabled"
+  else
+    err "Failed to restore sleep. Your Mac may stay awake when the lid closes."
+    err "Run this yourself:  sudo pmset -a disablesleep 0"
+  fi
+
+  if [ -f "$PIDFILE_WATCH" ]; then
+    local p; p="$(cat "$PIDFILE_WATCH")"
+    if [ -n "$p" ] && safe_ps_match "$p" "hot-bag _watch"; then
+      kill "$p" 2>/dev/null && ok "Watchdog stopped (pid $p)" || true
+    fi
+    rm -f "$PIDFILE_WATCH"
+  fi
+  if [ -f "$PIDFILE_CAFF" ]; then
+    local p; p="$(cat "$PIDFILE_CAFF")"
+    if [ -n "$p" ] && safe_ps_match "$p" "caffeinate"; then
+      kill "$p" 2>/dev/null && ok "caffeinate released (pid $p)" || true
+    fi
+    rm -f "$PIDFILE_CAFF"
+  fi
+  # Safety net: an earlier double-start could have orphaned another _watch loop
+  # before we adopted caffeinate -w. Sweep any strays owned by this script.
+  pkill -f "$0 _watch" 2>/dev/null || true
+
+  echo
+  report || true
+  [ "$restored" = 1 ] || exit 1
+}
+
+# ── report ──────────────────────────────────────────────────────────────────
+report() {
+  local logf="${1:-}"
+  if [ -z "$logf" ]; then
+    logf="$( [ -f "$CURRENT_RUN" ] && cat "$CURRENT_RUN" || true )"
+    [ -z "$logf" ] || [ ! -f "$logf" ] && logf="$(ls -t "$RUNS_DIR"/run-*.csv 2>/dev/null | head -1 || true)"
+  fi
+  if [ -z "$logf" ] || [ ! -f "$logf" ]; then
+    err "No run log found in $RUNS_DIR"; return 1
+  fi
+
+  printf '\033[1m── Hot bag report ─────────────────────────────────────\033[0m\n'
+  printf 'log: %s\n\n' "$logf"
+  awk -F, '
+  function human(b,  u,nn,i){ nn=split("B KB MB GB TB",u," "); i=1; while(b>=1024 && i<nn){b/=1024;i++} return sprintf("%.1f %s", b, u[i]) }
+  NR>1{
+    n++;
+    if($1<mine||!mine)mine=$1; if($1>maxe)maxe=$1;
+    if($3!="NA"){c++; cs+=$3; if($3+0>cmax)cmax=$3+0; if(cmin==""||$3+0<cmin)cmin=$3+0}
+    if($4!="NA"){g++; gs+=$4; if($4+0>gmax)gmax=$4+0; if(gmin==""||$4+0<gmin)gmin=$4+0}
+    if($6+0<slmin||slmin=="")slmin=$6+0;
+    if(bstart=="")bstart=$7; bend=$7; psrc=$8;
+    if($5=="WARM")warm++; if($5=="HOT")hot++; if($5=="CRITICAL")crit++;
+    if($6+0<100)thr++;            # speed-limit is the authoritative throttle signal
+    if($10=="down")down++;
+    # per-interface cumulative byte counters → delta = data used on that link
+    if($11+0>0){ if(!($9 in rxlo)||$11+0<rxlo[$9])rxlo[$9]=$11+0; if($11+0>rxhi[$9])rxhi[$9]=$11+0 }
+    if($12+0>0){ if(!($9 in txlo)||$12+0<txlo[$9])txlo[$9]=$12+0; if($12+0>txhi[$9])txhi[$9]=$12+0 }
+  }
+  END{
+    dur=maxe-mine; h=int(dur/3600); m=int((dur%3600)/60); s=dur%60;
+    printf "samples      : %d over %dh%02dm%02ds\n", n, h, m, s;
+    if(c) printf "CPU temp     : avg %.1f°C  min %.1f°C  max %.1f°C\n", cs/c, cmin, cmax;
+    else  printf "CPU temp     : (no valid readings)\n";
+    if(g) printf "GPU temp     : avg %.1f°C  min %.1f°C  max %.1f°C\n", gs/g, gmin, gmax;
+    printf "thermal      : %d WARM, %d HOT, %d CRITICAL, %d throttled\n", warm+0, hot+0, crit+0, thr+0;
+    printf "min CPU speed: %d%% %s\n", slmin, (slmin<100?"(throttling occurred)":"(never throttled)");
+    printf "battery      : %s%% → %s%% (last source: %s)\n", bstart, bend, psrc;
+    printf "connectivity : %d of %d samples DOWN (%.0f%% uptime)\n", down+0, n, (n? (n-down)*100/n : 0);
+    for(i in rxhi) totrx+=rxhi[i]-rxlo[i];
+    for(i in txhi) tottx+=txhi[i]-txlo[i];
+    printf "tether data  : ↓ %s  ↑ %s  (total %s, all traffic over the link)\n", human(totrx), human(tottx), human(totrx+tottx);
+
+    # ── verdict ──────────────────────────────────────────────────────────
+    # Pick a band from the hottest sensor; remember Apple silicon is designed
+    # to throttle (not damage) up around 100°C. These bands are tighter than
+    # "desk normal" on purpose — in a bag, airflow is the real constraint.
+    mt = (cmax+0 > gmax+0) ? cmax+0 : gmax+0;
+    bdrop = (bstart+0) - (bend+0);
+    has_temp = (c+0 > 0 || g+0 > 0);
+
+    printf "\n\033[1mverdict\033[0m\n";
+
+    if (!has_temp) {
+      printf "  \033[1;33m?\033[0m No °C readings (install smctemp for real temps: brew tap narugit/tap && brew install smctemp).\n";
+    } else if (mt < 60) {
+      printf "  \033[1;32m✓\033[0m Stayed cool (peak %.0f°C) — basically idle thermals. The bag handled this with no trouble.\n", mt;
+    } else if (mt < 80) {
+      printf "  \033[1;32m✓\033[0m Moderate heat (peak %.0f°C) — normal sustained-work range. Plenty of headroom.\n", mt;
+    } else if (mt < 90) {
+      printf "  \033[1;33m!\033[0m Ran warm (peak %.0f°C) — heavy-load range. On a desk this is fine; in a bag you used most of your airflow margin.\n", mt;
+    } else if (mt < 95) {
+      printf "  \033[1;33m!\033[0m Ran hot (peak %.0f°C) — approaching where Apple silicon starts pulling back clocks. Airflow was tight.\n", mt;
+    } else {
+      printf "  \033[1;31m✗\033[0m Critical heat (peak %.0f°C) — right at the throttle/shutdown zone. The chip is protected by design, but you were close to an emergency shutdown.\n", mt;
+    }
+
+    # Throttling — speed-limit is the authoritative signal (not the WARM/HOT tally).
+    if (slmin+0 < 100) {
+      printf "  \033[1;33m!\033[0m CPU clock dropped to %d%% — the OS throttled to manage heat/power. CPU-bound work ran proportionally slower during that window.\n", slmin;
+    } else if (has_temp && mt >= 80) {
+      printf "  \033[1;32m✓\033[0m CPU never throttled — your job ran at full clock the whole time despite the warmth.\n";
+    }
+
+    # Connectivity — only worth mentioning if it was actually flaky.
+    if (n > 0 && down+0 > n*0.1) {
+      printf "  \033[1;33m!\033[0m Network was flaky (%.0f%% uptime) — long-running calls may have stalled or retried.\n", (n-down)*100/n;
+    }
+
+    # Battery — only flag if the drain was substantial.
+    if (bdrop >= 30) {
+      printf "  \033[1;33m!\033[0m Battery dropped %d points (%d%% → %d%%) — keep the USB-C power bank plugged in for runs this long.\n", bdrop, bstart, bend;
+    } else if (psrc == "Battery Power" && bdrop >= 10) {
+      printf "  \033[1;32m✓\033[0m Battery handled it (%d%% → %d%%, -%d).\n", bstart, bend, bdrop;
+    }
+
+    # Bottom-line actionable suggestion for next run.
+    if (!has_temp) {
+      # no advice without temps
+    } else if (mt >= 95) {
+      printf "  \033[1;31m→\033[0m Next time: do not zip the bag, leave the laptop part-way out, or just run it at your desk. This was too hot.\n";
+    } else if (mt >= 90 || slmin+0 < 90) {
+      printf "  \033[1;33m→\033[0m Next time: unzip the bag fully, leave a vent edge sticking out, or shorten the run. You were near the limit.\n";
+    } else if (mt >= 80) {
+      printf "  →   Bag held up, but do not pack it tighter than this. Crack the zipper open if you want more margin.\n";
+    } else {
+      printf "  \033[1;32m→\033[0m Comfortable for this workload — you had margin to spare. Keep an air gap regardless.\n";
+    }
+  }' "$logf"
+}
+
+# ── status ──────────────────────────────────────────────────────────────────
+status() {
+  local cpu gpu sl batt psrc dev nstat state
+  cpu="$(read_cpu_c)"; gpu="$(read_gpu_c)"; sl="$(read_speed_limit)"
+  batt="$(read_batt_pct)"; psrc="$(read_power_src)"; dev="$(read_net_iface)"
+  if net_up; then nstat="up"; else nstat="down"; fi
+  state="$(thermal_state "$cpu" "$gpu" "$sl")"
+  local ds; ds="$(pmset -g 2>/dev/null | awk '/SleepDisabled/{print $2}')"
+  printf 'lid-closed-awake : %s\n' "$([ "${ds:-0}" = 1 ] && echo 'ON (hot bagging)' || echo off)"
+  if [ "${ds:-0}" = 1 ] && { [ ! -f "$PIDFILE_WATCH" ] || ! kill -0 "$(cat "$PIDFILE_WATCH" 2>/dev/null)" 2>/dev/null; }; then
+    warn "Sleep override is ON but no watchdog is running — wedged state."
+    warn "Fix it with:  hot-bag doctor   (or manually: sudo pmset -a disablesleep 0)"
+  fi
+  printf 'temperature      : CPU %s°C  GPU %s°C  → %s\n' "$cpu" "$gpu" "$state"
+  printf 'cpu speed limit  : %s%%\n' "$sl"
+  printf 'power            : %s%% on %s\n' "${batt:-?}" "${psrc:-?}"
+  printf 'network          : %s (%s)\n' "$(iface_label "$dev")" "$nstat"
+  if [ -f "$PIDFILE_WATCH" ] && kill -0 "$(cat "$PIDFILE_WATCH")" 2>/dev/null; then
+    local csv=""
+    [ -f "$CURRENT_RUN" ] && csv="$(cat "$CURRENT_RUN" 2>/dev/null || true)"
+    if [ -n "$csv" ] && [ -f "$csv" ]; then
+      local rxtx rx tx tot trx ttx
+      rxtx="$(read_iface_bytes "$dev")"; rx="${rxtx% *}"; tx="${rxtx#* }"
+      tot="$(run_data_used "$csv" "$dev" "$rx" "$tx")"; trx="${tot% *}"; ttx="${tot#* }"
+      printf 'data this run    : ↓ %s  ↑ %s  (total %s)\n' "$(human_bytes "$trx")" "$(human_bytes "$ttx")" "$(human_bytes "$((trx+ttx))")"
+    fi
+    printf 'watchdog         : running (pid %s) → %s\n' "$(cat "$PIDFILE_WATCH")" "$csv"
+  else
+    printf 'watchdog         : not running\n'
+  fi
+}
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+# Detect-and-repair a wedged state (e.g. after a crash or forced reboot): if
+# the sleep override is stuck on or stale processes / state files are lying
+# around, put things back to normal. Safe to run any time.
+doctor() {
+  local ds; ds="$(pmset -g 2>/dev/null | awk '/SleepDisabled/{print $2}')"
+  if [ "${ds:-0}" = 1 ]; then
+    if [ -f "$SLEEP_GUARD" ]; then
+      log "Sleep override is ON and was set by hot-bag — restoring…"
+      if sudo pmset -a disablesleep 0; then
+        ok "Restored sleep"
+        rm -f "$SLEEP_GUARD"
+      else
+        err "Failed to restore. Run:  sudo pmset -a disablesleep 0"
+      fi
+    else
+      warn "Sleep override is ON but no hot-bag guard marker — looks externally set."
+      warn "Refusing to clear it automatically. If you're sure you want to:"
+      warn "  sudo pmset -a disablesleep 0"
+    fi
+  else
+    ok "Sleep override is OFF"
+  fi
+  # Only kill processes we can verify are ours — never a bare `pkill caffeinate`
+  # (would whack the user's unrelated caffeinate sessions).
+  pkill -f "$0 _watch" 2>/dev/null || true
+  if [ -f "$PIDFILE_CAFF" ]; then
+    local p; p="$(cat "$PIDFILE_CAFF" 2>/dev/null || true)"
+    if [ -n "$p" ] && safe_ps_match "$p" "caffeinate"; then
+      kill "$p" 2>/dev/null || true
+    fi
+  fi
+  rm -f "$PIDFILE_WATCH" "$PIDFILE_CAFF" "$CURRENT_RUN" 2>/dev/null || true
+  rmdir "$LOCKDIR" 2>/dev/null || true
+  ok "Cleaned up stale state"
+}
+
+case "${1:-}" in
+  start)  start ;;
+  stop)   stop ;;
+  status) status ;;
+  report) report "${2:-}" ;;
+  doctor) doctor ;;
+  _watch) _watch "${2:?usage: _watch <logfile>}" ;;
+  *) echo "usage: hot-bag {start|stop|status|report [logfile]|doctor}" >&2; exit 2 ;;
+esac

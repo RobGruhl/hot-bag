@@ -1,0 +1,10 @@
+# runtime logs and state — never committed
+runs/
+*.csv
+current-run
+*.pid
+
+# local tooling / scratch
+.oraclerc
+.claude/
+.DS_Store

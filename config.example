@@ -1,0 +1,25 @@
+# hot-bag optional config.
+# Copy to ~/.config/hot-bag/config and edit. All values are optional;
+# anything you don't set uses the built-in default.
+
+# How often the watchdog samples, in seconds.
+# INTERVAL=30
+
+# Temperature thresholds (°C) used to label samples OK / WARM / HOT / CRITICAL.
+# WARN_C=80
+# HOT_C=90
+# CRIT_C=95
+
+# Host used for the connectivity ping.
+# PING_HOST=1.1.1.1
+
+# Wi-Fi fallback: if the link drops and these are set, the watchdog tries to
+# rejoin this hotspot automatically. Leave blank to disable.
+# WIFI_SSID="My iPhone"
+# WIFI_PASSWORD="hunter2"
+
+# Low-battery safety. 'sleep' = when on battery below LOW_BATT_PCT, let the Mac
+# sleep gracefully (state preserved) instead of risking a hard power-off.
+# 'none' = just log it. Requires passwordless sudo for pmset to work unattended.
+# LOW_BATT_ACTION=none
+# LOW_BATT_PCT=7
