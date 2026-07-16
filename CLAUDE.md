@@ -38,6 +38,21 @@ Intel.
   contains the expected string). `kill -0` alone can't tell our process apart
   from a PID-reused stranger.
 - `start` and `stop` take a mutex via `mkdir $LOCKDIR` so they can't overlap.
+- **Admin preflight before every sudo.** On managed Macs the user is a STANDARD
+  user until they temporarily elevate (commonly via SAP's **Privileges.app**).
+  Calling `sudo` while not in the admin group makes sudo itself print a hostile
+  "not in the sudoers file; this incident will be reported." So `ensure_admin`
+  runs *before* each `sudo pmset` in `start`/`stop`/`doctor`: it checks group
+  membership with `dseditgroup -o checkmember … admin` (LIVE directory state —
+  reflects a just-granted elevation, unlike `id`'s stale process groups, and is
+  what sudo itself consults), and if not elevated, offers to run `PrivilegesCLI
+  --add`, polls until admin lands, then proceeds. No CLI or no TTY → it prints
+  the manual steps and returns non-zero *before* sudo runs. **Invariant: never
+  call `sudo pmset` without an `ensure_admin` guard in front of it.** In `stop`,
+  a failed/declined elevation must NOT abort the rest of cleanup — the watchdog
+  and caffeinate are killed sudo-free regardless, and `stop` exits non-zero so
+  the still-on override is loud. The elevation is the user's call every time
+  (interactive `[y/N]`); we never elevate silently.
 - `doctor` is the recovery path when something *did* go wrong (crash, force
   reboot, canceled sudo): it restores sleep **only if `SLEEP_GUARD` exists**
   (proof hot-bag set the override), kills only processes verified by
@@ -61,10 +76,14 @@ Intel.
 
 Subcommands dispatched via a `case` at the bottom:
 - `start` — wait for internet (any link), baseline reading, `disablesleep 1`,
-  spawn `caffeinate`, spawn the watchdog detached via `nohup "$0" _watch <log> &`.
-- `stop` — `disablesleep 0` (non-fatal on failure), kill watchdog + caffeinate
-  via `safe_ps_match`, sweep any stragglers with `pkill -f "$0 _watch"`, then
-  `report`. Exits non-zero if the restore step failed so the user notices.
+  spawn `caffeinate`, spawn the watchdog detached via `nohup "$0" _watch <log> &`,
+  then spawn the lid-close chime watcher (`_lidwatch`) unless `LID_CHIME=off`.
+- `stop` — `disablesleep 0` (non-fatal on failure), kill watchdog + caffeinate +
+  lid watcher via `safe_ps_match`, sweep any stragglers with `pkill -f "$0
+  _watch"` / `pkill -f "$0 _lidwatch"`, then `diagnose_caffeinate` and `report`.
+  Exits non-zero if the restore step failed
+  so the user notices. Takes an optional `--kill-stray-caffeinate` flag (parsed
+  *before* `acquire_lock` so a bad flag can't strand the lock).
 - `status` — one-shot live reading (no sudo, no side effects). When a run is
   active (watchdog pid alive + `current-run` present), it also prints `data this
   run` by folding the live byte counters into `run_data_used()`. Warns loudly
@@ -73,35 +92,104 @@ Subcommands dispatched via a `case` at the bottom:
 - `doctor` — recovery: restore `disablesleep 0` if it's on, sweep stale
   `_watch`/`caffeinate` processes, remove stale pid/lock/state files. Safe to
   run any time.
+- `chime` — preview the 8-bit lid-close reminder sound (no sudo, no run needed).
 - `_watch <logfile>` — **internal**; the background sampling loop. Re-enters the
   same script so config flows in via exported env vars from `start`.
+- `_lidwatch` — **internal**; the lid-close chime watcher (see "Lid-close chime").
+- `_indicator-state` — **internal**; prints `on|wedged|off` for the menu-bar
+  indicator (see "Menu-bar indicator"). Cheap and side-effect-free (NO ping, no
+  sudo) so it's safe to poll every few seconds. `on`/`wedged` mirror the exact
+  on/wedged logic `status` uses (`watchdog_alive` + `SleepDisabled`), so the
+  glanceable icon can never disagree with the command. Keep it that way.
+
+### Lid-close chime (`_lidwatch`)
+
+An **opt-outable** audible reminder: when the lid closes during a run, play an
+8-bit sound so the user knows hot-bag is still going before the Mac goes in the
+bag. Fully **sudo-free** and decoupled — the CLI works whether or not it fires.
+
+- `start` spawns `_lidwatch` detached (`nohup "$0" _lidwatch &`, pid in
+  `lidwatch.pid`) right after caffeinate, and pre-generates the sound so the
+  first lid-close isn't delayed. Skipped entirely if `LID_CHIME=off` or `afplay`
+  is missing (warns in the latter case).
+- `_lidwatch` polls `lid_state()` every **2s** (deliberately faster than the 30s
+  telemetry cadence — the chime must fire *before* the lid is in the bag) and
+  calls `play_chime` on each **open→closed transition** only. It seeds `prev`
+  with the current state so a run started with the lid already shut doesn't
+  chime, and treats `unknown` reads as "keep last known state" so an `ioreg`
+  blip can't spuriously fire it.
+- **Lifecycled to the watchdog**, exactly like caffeinate: the loop condition is
+  `while watchdog_alive; do …`, so if the watchdog dies the chime watcher exits
+  on its own (within ~2s). It can never outlive a run. `stop`/`doctor` also kill
+  it explicitly via `safe_ps_match "$lp" "hot-bag _lidwatch"` + a
+  `pkill -f "$0 _lidwatch"` sweep, and remove `lidwatch.pid`.
+- `lid_state()` reads `ioreg -r -k AppleClamshellState` (No=open, Yes=closed) —
+  **sudo-free** and cheap (~35ms). This is the only no-install, no-admin way to
+  observe the lid on Apple Silicon. Don't regress it to something needing sudo.
+- The sound is a square-wave arpeggio (C5-E5-G5-C6) synthesized as an 8-bit
+  unsigned PCM WAV by an **embedded `perl` heredoc** in `generate_chime()`
+  (core perl only — matches the repo's no-third-party-deps ethos), cached at
+  `chime.wav` under `HOTBAG_HOME`. `LID_CHIME_FILE` overrides it with the user's
+  own audio (any format `afplay` reads — generation is then skipped);
+  `LID_CHIME_VOLUME` maps to `afplay -v`. `play_chime` is best-effort: it
+  backgrounds the play and never errors the caller.
+- **Scoped unmute** (`LID_CHIME_UNMUTE`, default on): if the Mac is muted,
+  `play_chime_scoped()` saves the current mute+volume via `osascript`, unmutes
+  (nudging volume off 0), plays in the **foreground** (so we don't re-mute
+  mid-beep), then restores the EXACT prior state. It only ever unmutes for the
+  duration of the one chime — a deliberate mute is respected everywhere else.
+  This is the ONE place hot-bag mutates unrelated user state, so it's guarded
+  hard: every `osascript`/`afplay` step is `|| true` so a failure under `set -e`
+  can't strand the Mac unmuted, and the restore always runs. `LID_CHIME_UNMUTE=off`
+  plays into the mute (silent) and never touches audio settings. When editing,
+  keep the play foreground *inside* the unmute window and keep the restore
+  unconditional — do not regress to a background play there (it would re-mute
+  before the sound finished) or drop the `|| true` guards.
+- `status` shows a `lid chime` line during a live run (armed / off / not
+  running), gated the same way as the watchdog line.
+
+### `diagnose_caffeinate` and the stray-caffeinate rule
+
+`stop` (and only `stop`) calls `diagnose_caffeinate <our_caff_pid> <kill 0|1>`
+after releasing its own caffeinate. It lists *other* caffeinate processes still
+holding sleep open and classifies each by its flags (`-d` ⇒ display+system sleep;
+no `-d` ⇒ idle-only, which does NOT block lid-close; `-t` ⇒ auto-expires).
+**Report-only by default** — it does NOT kill foreign caffeinate unless the user
+passed `--kill-stray-caffeinate`. This is the same invariant as `doctor`: never a
+bare `pkill caffeinate` (it would whack the user's unrelated terminal/Claude/
+editor caffeinate sessions). The only caffeinate `stop` kills unconditionally is
+its own, verified via `safe_ps_match`.
+
+## Menu-bar indicator (`indicator/`)
+
+Optional, **opt-in**, and fully decoupled — the CLI never depends on it. A tiny
+native Swift menu-bar agent (`NSStatusItem`, `.accessory` activation so no Dock
+icon) that polls `hot-bag _indicator-state` every few seconds and shows 🔥 (on) /
+⚠️ (wedged) / hidden (off). Built with the system `swiftc` (Xcode CLT) — no
+SwiftBar/xbar, no Homebrew, no third-party deps. Launched by a per-user
+LaunchAgent (`gui/<uid>` domain).
+
+- `indicator/HotBagIndicator.swift` — the agent. Owns NO state: it shells out to
+  `hot-bag _indicator-state` for every poll, so it's a pure view over the CLI's
+  truth. On any probe failure it falls back to `off` (a broken probe must never
+  imply the Mac is awake). `HOTBAG_BIN` overrides the script path; `HOTBAG_POLL_SECS`
+  the interval (default 5).
+- `indicator/com.hot-bag.indicator.plist.template` — LaunchAgent template;
+  `install.sh` substitutes `__BIN__/__HOTBAG__/__POLL__/__LOG__` and writes it to
+  `~/Library/LaunchAgents/`. The `HOTBAG_BIN` env var is passed in because a
+  launchd agent's PATH is minimal.
+- `indicator/install.sh` — `swiftc` build + `launchctl bootstrap` load;
+  `uninstall` subcommand boots it out and removes the plist. Idempotent (boots
+  out any prior instance before reloading). Logs to
+  `~/.local/state/hot-bag/indicator.log`.
+
+If you change what "on"/"wedged" mean, change it in `indicator_state()` in the
+Bash script — NOT in the Swift, which must stay a dumb view.
 
 State/logs live under `HOTBAG_HOME` (default `~/.local/state/hot-bag/`):
-`watchdog.pid`, `caffeinate.pid`, `menubar.pid`, `current-run` (path to active
-CSV), `disablesleep.on` (SLEEP_GUARD marker), `.lock` (start/stop mutex),
-`hot-bag-menubar` (compiled 🔥 helper), `runs/*.csv`.
-
-## Menu-bar flame indicator
-
-`start` shows a 🔥 in the macOS status bar for the duration of a run; `stop`
-and `doctor` remove it. Implementation: a tiny Swift `NSStatusItem` app whose
-source is embedded in the script as a heredoc (`menubar_build`), compiled once
-with `swiftc` (Xcode CLT) to `$HOTBAG_HOME/hot-bag-menubar`, and rebuilt when
-the script is newer than the binary (`$0 -nt` — follows the install symlink to
-the real file). Invariants:
-
-- **Optional by design.** No `swiftc`, compile failure, or `MENUBAR=0` must
-  never block `start` — `menubar_start` warns and returns 0. Don't make the
-  flame load-bearing.
-- **The helper self-terminates.** It gets the watchdog pid as argv[1] and
-  polls `kill(pid, 0)` every 5s, exiting when the watchdog is gone — so a
-  crashed run can't strand a stale flame even if `stop`/`doctor` never run.
-  Don't drop that argument.
-- Kills go through `safe_ps_match` on the pidfile plus a `pkill -f
-  "$MENUBAR_BIN"` stray sweep — safe because the binary path is unique to
-  hot-bag's state dir.
-- The Swift heredoc is quoted (`<<'SWIFT'`) so `$`/backticks in Swift are
-  literal. Keep it that way.
+`watchdog.pid`, `caffeinate.pid`, `lidwatch.pid`, `chime.wav` (generated 8-bit
+chime), `current-run` (path to active CSV), `disablesleep.on` (SLEEP_GUARD
+marker), `.lock` (start/stop mutex), `runs/*.csv`.
 
 ## CSV schema
 

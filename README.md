@@ -24,6 +24,7 @@ hot-bag start     # before you close the lid
 hot-bag status    # live reading, anytime (no sudo); shows data-used-so-far mid-run
 hot-bag stop      # when the job's done — prints the run report
 hot-bag report    # reprint the report for the latest run
+hot-bag chime     # preview the 8-bit lid-close reminder sound
 hot-bag doctor    # detect-and-repair a wedged state (see "If things get wedged")
 ```
 
@@ -55,11 +56,6 @@ When you're back: open the lid, `hot-bag stop`, read the report.
    `~/.local/state/hot-bag/runs/` — temperature, battery, connectivity, and
    **bytes used over the tether** (so the report tells you how much phone data
    the run burned).
-4. Lights a **🔥 in the menu bar** so you can see at a glance that hot-bag is
-   holding the Mac awake. It disappears on `stop` — and removes itself if the
-   watchdog ever dies, so it can't lie about a dead run. (Built once with the
-   Xcode Command Line Tools' `swiftc`; skipped with a warning if that's not
-   installed. `MENUBAR=0` turns it off.)
 
 `stop` reverses all of it (`disablesleep 0`, kills watchdog + caffeinate) and
 prints the report.
@@ -157,7 +153,10 @@ All optional. Set as environment variables, or copy `config.example` to
 | `WIFI_SSID` / `WIFI_PASSWORD` | *(blank)* | Wi-Fi to auto-rejoin on drop |
 | `LOW_BATT_ACTION` | `none` | `sleep` = graceful sleep when low on battery |
 | `LOW_BATT_PCT` | `7` | Battery % that triggers the safety |
-| `MENUBAR` | `1` | Show 🔥 in the menu bar while a run is active (`0` = off) |
+| `LID_CHIME` | `on` | Play an 8-bit sound when you close the lid mid-run (`off` to silence) |
+| `LID_CHIME_FILE` | *(blank)* | Your own audio file to play instead of the built-in chiptune |
+| `LID_CHIME_VOLUME` | *(blank)* | Playback volume `0.0`–`1.0` (blank = system volume) |
+| `LID_CHIME_UNMUTE` | `on` | If muted, briefly unmute *just for the chime* and restore your exact state after (`off` = play into the mute) |
 
 ---
 
@@ -170,12 +169,61 @@ cd ~/Projects/hot-bag
 brew tap narugit/tap && brew install smctemp   # for real °C (optional but recommended)
 ```
 
+## Lid-close chime (🔊 the "don't forget me" beep)
+
+When you shut the lid mid-run, hot-bag plays a short **8-bit chiptune** — a last
+audible confirmation that it's still going before the Mac disappears into your
+bag. On by default, no setup, no dependencies: the sound is a square-wave
+arpeggio synthesized on the fly with `perl` and played with the built-in
+`afplay`, and the lid is detected sudo-free via `ioreg` (`AppleClamshellState`).
+
+Preview it any time:
+
+```bash
+hot-bag chime
+```
+
+The chime runs as a tiny background watcher lifecycled to the run — it starts
+with `start`, stops with `stop`, and can never outlive the watchdog. Silence it
+with `LID_CHIME=off`, swap in your own sound with `LID_CHIME_FILE`, or set
+`LID_CHIME_VOLUME` (see *Config*).
+
+**Muted?** By default (`LID_CHIME_UNMUTE=on`) hot-bag briefly unmutes *just for
+the chime* and then restores your exact mute + volume — so you still hear the
+reminder even if you'd muted for a meeting, without leaving your Mac unmuted
+afterward. Set `LID_CHIME_UNMUTE=off` to respect the mute completely (the beep
+fires silently).
+
+## Menu-bar indicator (🔥 at a glance)
+
+Want to know at a glance whether hot-bag is on? Install the optional menu-bar
+indicator. It puts a small icon in the top bar:
+
+- **🔥** — actively hot bagging (lid-close sleep disabled, watchdog running)
+- **⚠️** — *wedged* (sleep override stuck on but no watchdog — run `hot-bag doctor`)
+- *(nothing)* — off; the icon hides itself so it's only there when it matters
+
+Click it for a quick menu: **Status…**, **Run doctor**, **Quit**.
+
+```bash
+./indicator/install.sh             # build + load (runs at login)
+./indicator/install.sh uninstall   # remove it
+```
+
+It's a tiny native Swift menu-bar agent (NSStatusItem) launched by `launchd` —
+**no third-party apps, no Homebrew, no Dock icon.** It owns no state of its own:
+every poll shells out to `hot-bag _indicator-state`, the single source of truth,
+so the icon can never disagree with `hot-bag status`. Built with the `swiftc`
+that ships with the Xcode Command Line Tools (`xcode-select --install` if you
+don't have them).
+
 ## Files
 
 ```
-hot-bag           the script (start/stop/status/report/doctor + internal _watch)
+hot-bag           the script (start/stop/status/report/chime/doctor + internal _watch/_lidwatch)
 install.sh        symlinks hot-bag into ~/.local/bin
 config.example    optional config template
+indicator/        optional menu-bar 🔥 indicator (Swift agent + LaunchAgent + installer)
 runs/             per-run CSV logs (gitignored; lives in ~/.local/state/hot-bag/runs)
 CLAUDE.md         architecture notes for AI-assisted debugging
 ```
@@ -191,6 +239,39 @@ graceful-sleep uses `sudo -n` and therefore needs a passwordless sudoers rule fo
 If you cancel the sudo prompt during `stop`, the script keeps cleaning up but
 prints a loud error and exits non-zero — the clamshell override will remain on
 until you run `sudo pmset -a disablesleep 0` yourself (or `hot-bag doctor`).
+
+### Managed Macs / temporary admin (SAP Privileges)
+
+On a managed Mac you're a *standard* user until you temporarily elevate (e.g.
+via **Privileges.app**). hot-bag checks your admin status **before** it calls
+`sudo`, so instead of sudo's unhelpful "this incident will be reported," you get:
+
+```
+! Needs temporary admin rights for: sudo pmset disablesleep
+! You are a standard user right now (SAP Privileges).
+
+  Elevate via Privileges now? [y/N] y
+▸ Requesting admin via PrivilegesCLI…
+✓ You are now admin (Privileges) — continuing
+```
+
+Answer `y` and hot-bag elevates you (via `PrivilegesCLI --add`), waits for it to
+land, and continues. Answer `n` (or if Privileges isn't found) and it prints the
+manual steps and exits *before* touching sudo. If `stop` can't elevate, it still
+kills the watchdog/caffeinate and exits non-zero so you know the override is
+still on — just re-run `hot-bag stop` (or `hot-bag doctor`) once you're elevated.
+
+## Stray caffeinate after stop
+
+On `stop`, after hot-bag releases its **own** `caffeinate`, it scans for any
+other `caffeinate` processes still holding sleep open and explains each one —
+whether it blocks lid-close sleep or only idle sleep, and whether it auto-expires
+(`-t`). It does **not** touch them: a bare `pkill caffeinate` would kill your
+terminal/editor/Claude sessions. To sweep the foreign ones anyway:
+
+```bash
+hot-bag stop --kill-stray-caffeinate
+```
 
 ## If things get wedged
 

@@ -24,7 +24,16 @@
 # LOW_BATT_ACTION=none
 # LOW_BATT_PCT=7
 
-# Menu-bar flame: show 🔥 in the macOS status bar while a run is active.
-# Needs the Xcode Command Line Tools (swiftc) for a one-time build; without
-# them start warns and runs without the icon. 0 = off.
-# MENUBAR=1
+# Lid-close chime: play an 8-bit sound when you shut the lid mid-run, as a last
+# audible "hot-bag is still going" before the Mac goes in the bag. 'on' (default)
+# plays a built-in chiptune generated on the fly; 'off' disables it.
+# Preview it any time with:  hot-bag chime
+# LID_CHIME=on
+# Point at your own audio file (anything afplay reads) to override the built-in.
+# LID_CHIME_FILE="$HOME/Sounds/my-8bit.wav"
+# Playback volume 0.0–1.0 (blank = current system volume).
+# LID_CHIME_VOLUME=0.6
+# If your Mac is muted, temporarily unmute JUST for the chime and restore your
+# exact mute/volume right after (default on). 'off' plays into the mute (silent)
+# and never touches your audio settings.
+# LID_CHIME_UNMUTE=on

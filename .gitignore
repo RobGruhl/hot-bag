@@ -4,6 +4,9 @@ runs/
 current-run
 *.pid
 
+# compiled menu-bar indicator binary (rebuilt by indicator/install.sh)
+indicator/HotBagIndicator
+
 # local tooling / scratch
 .oraclerc
 .claude/

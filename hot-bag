@@ -9,9 +9,14 @@
 #
 #   hot-bag start    verify internet, disable clamshell sleep, start watchdog
 #   hot-bag stop     restore sleep, stop watchdog, print the run report
+#                    (--kill-stray-caffeinate also sweeps foreign caffeinate)
 #   hot-bag status   show a live one-shot reading
 #   hot-bag report   print the report for the latest (or a given) run
-#   hot-bag _watch    (internal) the background sampling loop
+#   hot-bag chime    preview the 8-bit lid-close reminder sound
+#   hot-bag doctor   recover a wedged state (restore sleep, clean stale files)
+#   hot-bag _watch            (internal) the background sampling loop
+#   hot-bag _lidwatch         (internal) plays the chime on lid close during a run
+#   hot-bag _indicator-state  (internal) on|wedged|off for the menu-bar icon
 #
 # The ONE manual step no command can do for you: turn the tether ON.
 #   - USB tether:  plug the phone in, enable Personal Hotspot / USB tethering.
@@ -24,11 +29,11 @@ HOTBAG_HOME="${HOTBAG_HOME:-$HOME/.local/state/hot-bag}"
 RUNS_DIR="$HOTBAG_HOME/runs"
 PIDFILE_WATCH="$HOTBAG_HOME/watchdog.pid"
 PIDFILE_CAFF="$HOTBAG_HOME/caffeinate.pid"
+PIDFILE_LID="$HOTBAG_HOME/lidwatch.pid"     # lid-close chime watcher
+CHIME_WAV="$HOTBAG_HOME/chime.wav"          # cached generated 8-bit chime
 CURRENT_RUN="$HOTBAG_HOME/current-run"      # holds path to the active CSV
 LOCKDIR="$HOTBAG_HOME/.lock"                # prevents overlapping start/stop
 SLEEP_GUARD="$HOTBAG_HOME/disablesleep.on"  # marker that we set disablesleep=1
-PIDFILE_MENU="$HOTBAG_HOME/menubar.pid"
-MENUBAR_BIN="$HOTBAG_HOME/hot-bag-menubar"  # compiled 🔥 status-bar helper
 
 INTERVAL="${INTERVAL:-30}"                   # seconds between samples
 WARN_C="${WARN_C:-80}"                        # °C: start paying attention
@@ -47,10 +52,19 @@ WIFI_PASSWORD="${WIFI_PASSWORD:-}"
 LOW_BATT_ACTION="${LOW_BATT_ACTION:-none}"
 LOW_BATT_PCT="${LOW_BATT_PCT:-7}"
 
-# Menu-bar flame: show 🔥 in the macOS status bar while a run is active.
-# Needs the Xcode Command Line Tools (swiftc) for a one-time build; if they
-# are missing, start just warns and runs without the icon.
-MENUBAR="${MENUBAR:-1}"
+# Lid-close chime: play an 8-bit sound when you close the lid while hot bagging,
+# as a last audible reminder before the Mac goes in the bag. 'on' (default) plays
+# the built-in chiptune; 'off' disables it. LID_CHIME_FILE points at your own
+# audio file (any format afplay understands) to override the built-in sound.
+# LID_CHIME_VOLUME is 0.0–1.0 passed to afplay -v (blank = system volume).
+# LID_CHIME_UNMUTE: if 'on' (default) and the Mac is muted, temporarily unmute
+# JUST for the chime and restore the exact prior mute/volume right after — so a
+# deliberate mute is respected everywhere except that one beep. 'off' plays into
+# the mute (silent) and never touches your audio settings.
+LID_CHIME="${LID_CHIME:-on}"
+LID_CHIME_FILE="${LID_CHIME_FILE:-}"
+LID_CHIME_VOLUME="${LID_CHIME_VOLUME:-}"
+LID_CHIME_UNMUTE="${LID_CHIME_UNMUTE:-on}"
 
 [ -f "$HOME/.config/hot-bag/config" ] && . "$HOME/.config/hot-bag/config"
 
@@ -64,7 +78,6 @@ for _v in INTERVAL WARN_C HOT_C CRIT_C LOW_BATT_PCT; do
   esac
 done
 unset _v
-case "$MENUBAR" in 0|1) ;; *) printf '\033[1;31m✗\033[0m Invalid MENUBAR=%s — must be 0 or 1\n' "$MENUBAR" >&2; exit 2 ;; esac
 
 mkdir -p "$RUNS_DIR"
 
@@ -81,6 +94,82 @@ acquire_lock() {
 release_lock() { rmdir "$LOCKDIR" 2>/dev/null || true; }
 # kill -0 only proves a PID exists; this proves it's actually ours.
 safe_ps_match() { local pid="$1" pat="$2"; ps -o command= -p "$pid" 2>/dev/null | grep -q -- "$pat"; }
+
+# Is the watchdog actually alive and ours? (PID exists AND command matches.)
+watchdog_alive() {
+  [ -f "$PIDFILE_WATCH" ] || return 1
+  local p; p="$(cat "$PIDFILE_WATCH" 2>/dev/null || true)"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && safe_ps_match "$p" "hot-bag _watch"
+}
+
+# ── admin / privilege preflight ───────────────────────────────────────────────
+# On managed Macs the user is a STANDARD user until they temporarily elevate
+# (commonly via SAP's Privileges.app). If we call `sudo` while not in the admin
+# group, sudo itself prints a hostile "you are not in the sudoers file; this
+# incident will be reported" — useless to the user. So we check group membership
+# FIRST and, if needed, offer to elevate via Privileges before any sudo runs.
+
+# True if the current user is in the admin group RIGHT NOW. Uses dseditgroup
+# (live directory state) rather than `id` (process groups, stale until re-login)
+# so it reflects an elevation that just happened — which is also what sudo sees.
+is_admin() { dseditgroup -o checkmember -m "$(id -un)" admin 2>/dev/null | grep -q '^yes'; }
+
+# Path to SAP Privileges' CLI, if installed. Empty string if not found.
+privileges_cli() {
+  local p
+  for p in /usr/local/bin/PrivilegesCLI \
+           /Applications/Privileges.app/Contents/MacOS/PrivilegesCLI \
+           "$HOME/Applications/Privileges.app/Contents/MacOS/PrivilegesCLI"; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Make sure we have admin rights before a sudo call. Returns 0 if elevated (now
+# or already), non-zero if the caller should abort the privileged step.
+#   arg1: short description of what needs admin (shown to the user)
+ensure_admin() {
+  if is_admin; then return 0; fi
+  local what="${1:-the privileged step}"
+  local cli; cli="$(privileges_cli || true)"
+
+  warn "Needs temporary admin rights for: $what"
+  warn "You are a standard user right now${cli:+ (SAP Privileges)}."
+
+  # Can't or shouldn't drive it ourselves: no Privileges CLI, or no TTY to
+  # prompt on. Tell the user exactly what to do and bail BEFORE sudo scolds them.
+  if [ -z "$cli" ] || [ ! -t 0 ]; then
+    err "Grant admin first, then rerun:"
+    if [ -n "$cli" ]; then
+      err "  • click the Privileges item in your menu bar, OR"
+      err "  • run:  $cli --add"
+    else
+      err "  • use your Privileges menu-bar item, or log in as an admin user"
+    fi
+    return 1
+  fi
+
+  printf '\n  Elevate via Privileges now? [y/N] '
+  # `|| ans=` so an EOF (Ctrl-D) doesn't trip `set -e` in the caller — it just
+  # falls through to the default "no".
+  local ans=""; read -r ans || ans=""
+  case "$ans" in
+    [yY]|[yY][eE][sS]) ;;
+    *) err "Not elevating. Grant admin yourself ($cli --add) and rerun."; return 1 ;;
+  esac
+
+  log "Requesting admin via PrivilegesCLI…"
+  "$cli" --add --reason "hot-bag: hold the Mac awake for an unattended run" >/dev/null 2>&1 \
+    || "$cli" --add >/dev/null 2>&1 || true
+
+  # Privileges applies the group change asynchronously; poll until it lands.
+  local tries=0
+  while ! is_admin && [ "$tries" -lt 20 ]; do sleep 0.25; tries=$((tries+1)); done
+
+  if is_admin; then ok "You are now admin (Privileges) — continuing"; return 0; fi
+  err "Elevation did not take. Grant admin via the Privileges menu-bar item and rerun."
+  return 1
+}
 
 # ── telemetry readers (all sudo-free, so the watchdog never needs a password) ─
 read_cpu_c() { # real °C via smctemp; NA if unavailable/invalid
@@ -165,81 +254,155 @@ thermal_state() { # args: cpu gpu speedlimit
   }'
 }
 
-# ── menu-bar flame indicator ────────────────────────────────────────────────
-# A tiny Swift NSStatusItem app that shows 🔥 in the menu bar while a run is
-# active. Compiled once into $HOTBAG_HOME (rebuilt when this script is newer
-# than the binary). The helper is passed the watchdog pid and terminates
-# itself when that pid disappears, so even a crashed run can never strand a
-# stale flame. Entirely optional — no swiftc, or MENUBAR=0, and the run
-# proceeds without it.
-menubar_build() {
-  command -v swiftc >/dev/null 2>&1 || return 1
-  if [ ! -x "$MENUBAR_BIN" ] || [ "$0" -nt "$MENUBAR_BIN" ]; then
-    log "Building menu-bar flame indicator (one-time)…"
-    local src="$HOTBAG_HOME/menubar.swift"
-    cat > "$src" <<'SWIFT'
-import AppKit
+# ── lid-close chime ───────────────────────────────────────────────────────────
+# Play an 8-bit sound the moment the lid closes during a run — the last audible
+# "yes, hot-bag is still going" before the Mac disappears into the bag. Runs as a
+# tiny sudo-free background loop (`_lidwatch`) lifecycled to the watchdog, exactly
+# like caffeinate: if the watchdog dies, the lid watcher exits too.
 
-// hot-bag menu-bar flame. argv[1] = watchdog pid: we poll it and terminate
-// ourselves when it is gone, so the icon can never outlive the run.
-let watchPid: pid_t = CommandLine.arguments.count > 1
-    ? (pid_t(CommandLine.arguments[1]) ?? 0) : 0
-
-final class Delegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem?
-    func applicationDidFinishLaunching(_ note: Notification) {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "🔥"
-        item.button?.toolTip = "hot-bag is holding this Mac awake"
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "hot-bag is running — end with: hot-bag stop",
-                                action: nil, keyEquivalent: ""))
-        item.menu = menu
-        statusItem = item
-        if watchPid > 0 {
-            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-                if kill(watchPid, 0) != 0 { NSApp.terminate(nil) }
-            }
-        }
-    }
+# Clamshell state, sudo-free. Echoes "closed", "open", or "unknown".
+# AppleClamshellState flips No→Yes when the lid shuts (readable without admin).
+lid_state() {
+  local v
+  v="$(ioreg -r -k AppleClamshellState -d 4 2>/dev/null \
+       | awk -F'= ' '/"AppleClamshellState"/{gsub(/[^A-Za-z]/,"",$2); print $2; exit}')"
+  case "$v" in
+    Yes) echo closed ;;
+    No)  echo open ;;
+    *)   echo unknown ;;
+  esac
 }
 
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
-let delegate = Delegate()
-app.delegate = delegate
-app.run()
-SWIFT
-    if ! swiftc -O -o "$MENUBAR_BIN" "$src" 2>/dev/null; then
-      rm -f "$src" "$MENUBAR_BIN"
-      return 1
-    fi
-    rm -f "$src"
+# The sound file to play: an explicit LID_CHIME_FILE, else the generated chiptune.
+chime_file() {
+  if [ -n "$LID_CHIME_FILE" ]; then echo "$LID_CHIME_FILE"; return; fi
+  [ -s "$CHIME_WAV" ] || generate_chime "$CHIME_WAV"
+  echo "$CHIME_WAV"
+}
+
+# Synthesize a classic rising 8-bit square-wave arpeggio (C5-E5-G5-C6) as an
+# 8-bit unsigned PCM WAV. Pure perl + core modules, no third-party deps — matches
+# the repo's "no installs" ethos. Cached; only regenerated if missing.
+generate_chime() { # arg: output path
+  local out="$1"
+  command -v perl >/dev/null 2>&1 || { err "perl not found — cannot generate the chime"; return 1; }
+  perl - "$out" <<'PERL'
+my $out = $ARGV[0] or exit 1;
+my $SR  = 11025;                 # low rate = crunchy chiptune feel
+my $amp = 90;                    # 0..127; below full-scale so it isn't harsh
+my @notes = ([523,90],[659,90],[784,90],[1047,160]);   # C5 E5 G5 C6 (ms each)
+my $data = "";
+for my $n (@notes) {
+  my ($f,$ms) = @$n;
+  my $samples = int($SR * $ms / 1000);
+  my $period  = $SR / $f;
+  for (my $i=0; $i<$samples; $i++) {
+    my $hi  = (($i % $period) < ($period/2));           # square wave
+    my $env = 1 - ($i/$samples)*0.15;                   # gentle fade to cut clicks
+    my $v = 128 + ($hi ? 1 : -1) * int($amp*$env);
+    $v = 0 if $v < 0; $v = 255 if $v > 255;
+    $data .= chr($v);
+  }
+}
+my $dlen = length($data);
+open my $fh, '>:raw', $out or exit 1;
+print $fh "RIFF", pack('V', 36 + $dlen), "WAVE";
+print $fh "fmt ", pack('V',16), pack('v',1), pack('v',1);   # PCM, mono
+print $fh pack('V',$SR), pack('V',$SR), pack('v',1), pack('v',8);  # rate, byterate, blockalign, bits
+print $fh "data", pack('V',$dlen), $data;
+close $fh;
+PERL
+}
+
+# afplay the file once, honoring LID_CHIME_VOLUME. Foreground (blocks) so a
+# caller that unmuted first can safely re-mute only after the sound has finished.
+afplay_once() { # arg: file
+  if [ -n "$LID_CHIME_VOLUME" ]; then
+    afplay -v "$LID_CHIME_VOLUME" "$1" >/dev/null 2>&1
+  else
+    afplay "$1" >/dev/null 2>&1
   fi
 }
 
-menubar_start() { # arg: watchdog pid
-  [ "$MENUBAR" = 1 ] || return 0
-  if ! menubar_build; then
-    warn "Menu-bar flame skipped (swiftc unavailable or build failed) — the run works fine without it."
+# Play the chime with a mute-scoped unmute: if the Mac is muted and
+# LID_CHIME_UNMUTE is on, save the current mute+volume, unmute (nudging volume up
+# if it's at 0) JUST for this beep, play in the FOREGROUND, then restore the
+# EXACT prior state — so the sound is heard but a deliberate mute is left
+# untouched everywhere else. If not muted (or unmute disabled), just play.
+# Every step is guarded with `|| true` so a nonzero osascript/afplay can never
+# abort this mid-way under `set -e` and strand the Mac unmuted; the restore
+# always runs. Blocks for the ~0.5s chime, which is fine in _lidwatch and chime.
+play_chime_scoped() { # arg: file
+  local f="$1"
+  local saved_m="" saved_v="" settings=""
+  if [ "$LID_CHIME_UNMUTE" != off ] && command -v osascript >/dev/null 2>&1; then
+    settings="$(osascript -e 'set s to (get volume settings)' \
+                          -e 'return (output muted of s as text) & " " & (output volume of s as text)' 2>/dev/null || true)"
+    saved_m="${settings%% *}"; saved_v="${settings##* }"
+  fi
+  if [ "$saved_m" != true ]; then
+    afplay_once "$f"; return 0
+  fi
+  # Muted + unmute enabled: unmute, (nudge volume off 0), play, then restore.
+  osascript -e 'set volume output muted false' >/dev/null 2>&1 || true
+  case "$saved_v" in ''|0) osascript -e 'set volume output volume 25' >/dev/null 2>&1 || true ;; esac
+  afplay_once "$f" || true
+  # Restore: volume first (setting a numeric volume implicitly clears mute), then
+  # re-apply the mute the user had. Only touch volume if we have a valid number.
+  case "$saved_v" in ''|*[!0-9]*) ;; *) osascript -e "set volume output volume $saved_v" >/dev/null 2>&1 || true ;; esac
+  osascript -e 'set volume output muted true' >/dev/null 2>&1 || true
+}
+
+# Play the chime once, best-effort. Never errors out the caller. Respects
+# LID_CHIME=off. Backgrounds the scoped play so the caller (the lid loop) isn't
+# blocked for the duration of the tone.
+play_chime() {
+  [ "$LID_CHIME" = off ] && return 0
+  command -v afplay >/dev/null 2>&1 || return 0
+  local f; f="$(chime_file)"
+  [ -n "$f" ] && [ -f "$f" ] || return 0
+  play_chime_scoped "$f" &
+}
+
+# Background lid watcher: chime on each open→closed transition while the run is
+# live. Sudo-free and self-terminating — polls fast (2s) so it fires before the
+# lid is actually in the bag, and exits the instant the watchdog goes away.
+_lidwatch() {
+  set +eo pipefail
+  # Seed with the current state so we only chime on a genuine *transition*, not
+  # if the lid was already shut when the run started.
+  local prev; prev="$(lid_state)"
+  while watchdog_alive; do
+    local now; now="$(lid_state)"
+    if [ "$now" = closed ] && [ "$prev" != closed ]; then
+      play_chime
+    fi
+    [ "$now" = unknown ] || prev="$now"   # ignore transient unknowns, keep last real state
+    sleep 2
+  done
+}
+
+# Play the lid-close chime once, on demand, so you can hear it without a run.
+chime_preview() {
+  if [ "$LID_CHIME" = off ]; then
+    warn "LID_CHIME is off — no sound will play on lid close. Set LID_CHIME=on to enable it."
     return 0
   fi
-  nohup "$MENUBAR_BIN" "$1" >/dev/null 2>&1 &
-  echo $! > "$PIDFILE_MENU"
-  ok "Menu-bar flame lit (pid $(cat "$PIDFILE_MENU")) — 🔥 up top while hot bagging"
-}
-
-menubar_stop() {
-  if [ -f "$PIDFILE_MENU" ]; then
-    local p; p="$(cat "$PIDFILE_MENU" 2>/dev/null || true)"
-    if [ -n "$p" ] && safe_ps_match "$p" "hot-bag-menubar"; then
-      kill "$p" 2>/dev/null && ok "Menu-bar flame out (pid $p)" || true
-    fi
-    rm -f "$PIDFILE_MENU"
+  if ! command -v afplay >/dev/null 2>&1; then
+    err "afplay not found — cannot play the chime on this system."
+    return 1
   fi
-  # Stray sweep — the binary path is unique to hot-bag's state dir, so this
-  # can't touch anything that isn't ours.
-  pkill -f "$MENUBAR_BIN" 2>/dev/null || true
+  local f; f="$(chime_file)"
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    err "Could not produce a chime file."
+    return 1
+  fi
+  log "Playing lid-close chime: $f"
+  # Foreground (via the scoped player) so the command doesn't return before you
+  # hear it, and so the preview matches the real behavior — including the
+  # temporary unmute if you're muted and LID_CHIME_UNMUTE is on.
+  play_chime_scoped "$f"
+  ok "That's the sound you'll hear when you close the lid mid-run."
 }
 
 # ── the background watchdog ─────────────────────────────────────────────────
@@ -328,6 +491,12 @@ start() {
     warn "For real °C, stop and install it first:  brew tap narugit/tap && brew install smctemp"
   fi
 
+  # Make sure we can actually use sudo before we call it, so a standard user
+  # gets a helpful prompt instead of sudo's "incident will be reported".
+  if ! ensure_admin "sudo pmset disablesleep (hold the Mac awake)"; then
+    exit 1   # trap restores nothing (need_cleanup still 0) and releases the lock
+  fi
+
   log "Disabling clamshell (lid-closed) sleep — needs sudo…"
   sudo pmset -a disablesleep 1
   : > "$SLEEP_GUARD"
@@ -350,7 +519,20 @@ start() {
   ok "caffeinate holding (pid $(cat "$PIDFILE_CAFF"))"
   ok "Watchdog logging every ${INTERVAL}s → $logf"
 
-  menubar_start "$wpid"
+  # Lid-close chime: pre-generate the sound now (so a slow first-play doesn't
+  # eat the transition) and launch the sudo-free lid watcher, detached and
+  # lifecycled to the watchdog. Opt out with LID_CHIME=off.
+  if [ "$LID_CHIME" != off ]; then
+    if command -v afplay >/dev/null 2>&1; then
+      [ -n "$LID_CHIME_FILE" ] || generate_chime "$CHIME_WAV" >/dev/null 2>&1 || true
+      LID_CHIME="$LID_CHIME" LID_CHIME_FILE="$LID_CHIME_FILE" LID_CHIME_VOLUME="$LID_CHIME_VOLUME" \
+        nohup "$0" _lidwatch >/dev/null 2>&1 &
+      echo $! > "$PIDFILE_LID"
+      ok "Lid-close chime armed — you'll hear an 8-bit tone when you shut the lid (LID_CHIME=off to silence)"
+    else
+      warn "afplay not found — lid-close chime disabled for this run."
+    fi
+  fi
 
   echo
   ok "Ready — close the lid and pack it. Happy hot bagging. 🎒🔥"
@@ -366,21 +548,80 @@ start() {
   release_lock
 }
 
+# ── caffeinate diagnosis ──────────────────────────────────────────────────────
+# After stop has released its OWN caffeinate, look for any OTHER caffeinate
+# processes still holding sleep open and explain them. Report-only by design:
+# per CLAUDE.md we never do a bare `pkill caffeinate` (it would whack the user's
+# unrelated sessions — terminals, Claude, scripts). Foreign processes are only
+# killed when the caller explicitly passed --kill-stray-caffeinate.
+#   args: <our_caff_pid_to_exclude> <kill_flag 0|1>
+diagnose_caffeinate() {
+  local ours="${1:-}" do_kill="${2:-0}"
+  local pids p cmd found=0
+  pids="$(pgrep -x caffeinate 2>/dev/null || true)"
+  for p in $pids; do
+    [ "$p" = "$ours" ] && continue            # the one stop just released
+    cmd="$(ps -o command= -p "$p" 2>/dev/null || true)"
+    [ -z "$cmd" ] && continue                 # exited between pgrep and now
+    found=$((found+1))
+    # Classify the assertion strength from the flags. -d holds the DISPLAY (and
+    # system) awake; without it caffeinate blocks only IDLE system sleep, which
+    # does NOT keep the lid-closed machine awake — that's `disablesleep`, which
+    # is hot-bag's job and which stop has already restored.
+    local kind note=""
+    case " $cmd " in
+      *" -"*d*w*) kind="hot-bag-style (display+system, tied to a pid) — possible stray from an earlier run" ;;
+      *" -"*d*)   kind="display + system sleep" ;;
+      *)          kind="idle system sleep only — does NOT block lid-close" ;;
+    esac
+    case " $cmd " in
+      *" -t "*) note="  (has -t timeout — auto-expires on its own)" ;;
+    esac
+    [ "$found" = 1 ] && warn "caffeinate check : other caffeinate process(es) still holding sleep open (NOT hot-bag's):"
+    printf '    pid %-6s %s\n' "$p" "$cmd"
+    printf '            → %s%s\n' "$kind" "$note"
+    if [ "$do_kill" = 1 ]; then
+      kill "$p" 2>/dev/null && ok "      killed pid $p (you passed --kill-stray-caffeinate)" \
+                            || err "      could not kill pid $p"
+    fi
+  done
+  if [ "$found" = 0 ]; then
+    ok "caffeinate check : no other caffeinate processes — clean."
+  elif [ "$do_kill" != 1 ]; then
+    warn "  → hot-bag left these alone. Idle-only ones don't affect lid-close sleep, and"
+    warn "    -t ones expire by themselves. To sweep them now: hot-bag stop --kill-stray-caffeinate"
+  fi
+}
+
 # ── stop ────────────────────────────────────────────────────────────────────
 stop() {
+  # Parse flags before taking the lock so a usage error can't strand it held.
+  local kill_stray=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kill-stray-caffeinate) kill_stray=1 ;;
+      *) err "Unknown option: $1"; err "usage: hot-bag stop [--kill-stray-caffeinate]"; exit 2 ;;
+    esac
+    shift
+  done
   acquire_lock
   trap 'release_lock' EXIT
   local restored=0
   log "Restoring normal sleep behavior — needs sudo…"
   # Do NOT let a sudo failure abort us here — leaving disablesleep=1 is the
   # worst possible outcome. Try, surface the error loudly, keep cleaning up.
-  if sudo pmset -a disablesleep 0; then
+  # Preflight admin first so a standard user gets a useful prompt rather than
+  # sudo's "incident reported" — but if elevation fails we STILL fall through to
+  # kill the watchdog/caffeinate (no sudo needed) and exit non-zero below.
+  if ensure_admin "sudo pmset disablesleep 0 (re-enable lid-close sleep)" \
+     && sudo pmset -a disablesleep 0; then
     restored=1
     rm -f "$SLEEP_GUARD"
     ok "Clamshell sleep re-enabled"
   else
     err "Failed to restore sleep. Your Mac may stay awake when the lid closes."
-    err "Run this yourself:  sudo pmset -a disablesleep 0"
+    err "Once you have admin, run this yourself:  sudo pmset -a disablesleep 0"
+    err "  (or: hot-bag doctor — it will restore sleep when you are elevated)"
   fi
 
   if [ -f "$PIDFILE_WATCH" ]; then
@@ -390,18 +631,30 @@ stop() {
     fi
     rm -f "$PIDFILE_WATCH"
   fi
+  local our_caff=""
   if [ -f "$PIDFILE_CAFF" ]; then
-    local p; p="$(cat "$PIDFILE_CAFF")"
-    if [ -n "$p" ] && safe_ps_match "$p" "caffeinate"; then
-      kill "$p" 2>/dev/null && ok "caffeinate released (pid $p)" || true
+    our_caff="$(cat "$PIDFILE_CAFF")"
+    if [ -n "$our_caff" ] && safe_ps_match "$our_caff" "caffeinate"; then
+      kill "$our_caff" 2>/dev/null && ok "caffeinate released (pid $our_caff)" || true
     fi
     rm -f "$PIDFILE_CAFF"
+  fi
+  if [ -f "$PIDFILE_LID" ]; then
+    local lp; lp="$(cat "$PIDFILE_LID")"
+    if [ -n "$lp" ] && safe_ps_match "$lp" "hot-bag _lidwatch"; then
+      kill "$lp" 2>/dev/null && ok "Lid-close chime stopped (pid $lp)" || true
+    fi
+    rm -f "$PIDFILE_LID"
   fi
   # Safety net: an earlier double-start could have orphaned another _watch loop
   # before we adopted caffeinate -w. Sweep any strays owned by this script.
   pkill -f "$0 _watch" 2>/dev/null || true
+  pkill -f "$0 _lidwatch" 2>/dev/null || true
 
-  menubar_stop
+  # Account for any caffeinate still holding sleep open — report-only unless
+  # --kill-stray-caffeinate was passed. Excludes the one we just released (it
+  # may not have fully exited yet).
+  diagnose_caffeinate "$our_caff" "$kill_stray"
 
   echo
   report || true
@@ -536,6 +789,16 @@ status() {
       printf 'data this run    : ↓ %s  ↑ %s  (total %s)\n' "$(human_bytes "$trx")" "$(human_bytes "$ttx")" "$(human_bytes "$((trx+ttx))")"
     fi
     printf 'watchdog         : running (pid %s) → %s\n' "$(cat "$PIDFILE_WATCH")" "$csv"
+    local lchime='off'
+    if [ "$LID_CHIME" != off ] && [ -f "$PIDFILE_LID" ] \
+       && safe_ps_match "$(cat "$PIDFILE_LID" 2>/dev/null)" "hot-bag _lidwatch"; then
+      lchime="armed (chimes on lid close)"
+    elif [ "$LID_CHIME" = off ]; then
+      lchime='off (LID_CHIME=off)'
+    else
+      lchime='not running'
+    fi
+    printf 'lid chime        : %s\n' "$lchime"
   else
     printf 'watchdog         : not running\n'
   fi
@@ -550,11 +813,12 @@ doctor() {
   if [ "${ds:-0}" = 1 ]; then
     if [ -f "$SLEEP_GUARD" ]; then
       log "Sleep override is ON and was set by hot-bag — restoring…"
-      if sudo pmset -a disablesleep 0; then
+      if ensure_admin "sudo pmset disablesleep 0 (re-enable lid-close sleep)" \
+         && sudo pmset -a disablesleep 0; then
         ok "Restored sleep"
         rm -f "$SLEEP_GUARD"
       else
-        err "Failed to restore. Run:  sudo pmset -a disablesleep 0"
+        err "Failed to restore. Once you have admin, run:  sudo pmset -a disablesleep 0"
       fi
     else
       warn "Sleep override is ON but no hot-bag guard marker — looks externally set."
@@ -567,24 +831,45 @@ doctor() {
   # Only kill processes we can verify are ours — never a bare `pkill caffeinate`
   # (would whack the user's unrelated caffeinate sessions).
   pkill -f "$0 _watch" 2>/dev/null || true
+  pkill -f "$0 _lidwatch" 2>/dev/null || true
   if [ -f "$PIDFILE_CAFF" ]; then
     local p; p="$(cat "$PIDFILE_CAFF" 2>/dev/null || true)"
     if [ -n "$p" ] && safe_ps_match "$p" "caffeinate"; then
       kill "$p" 2>/dev/null || true
     fi
   fi
-  menubar_stop
-  rm -f "$PIDFILE_WATCH" "$PIDFILE_CAFF" "$CURRENT_RUN" 2>/dev/null || true
+  rm -f "$PIDFILE_WATCH" "$PIDFILE_CAFF" "$PIDFILE_LID" "$CURRENT_RUN" 2>/dev/null || true
   rmdir "$LOCKDIR" 2>/dev/null || true
   ok "Cleaned up stale state"
 }
 
+# ── _indicator-state (internal) ───────────────────────────────────────────────
+# Single source of truth for the menu-bar indicator. Cheap and side-effect-free
+# (NO network ping, no sudo) so it can be polled every few seconds. Prints one
+# token on the first line; the indicator maps it to an icon:
+#   on      watchdog alive AND sleep override on  → actively hot bagging  🔥
+#   wedged  sleep override on but no live watchdog → needs `doctor`       ⚠️
+#   off     sleep override off                     → hidden
+# Mirrors the on/wedged logic in `status` so the glanceable signal never
+# disagrees with the command.
+indicator_state() {
+  local ds; ds="$(pmset -g 2>/dev/null | awk '/SleepDisabled/{print $2}')"
+  if [ "${ds:-0}" = 1 ]; then
+    if watchdog_alive; then echo on; else echo wedged; fi
+  else
+    echo off
+  fi
+}
+
 case "${1:-}" in
   start)  start ;;
-  stop)   stop ;;
+  stop)   shift; stop "$@" ;;
   status) status ;;
   report) report "${2:-}" ;;
   doctor) doctor ;;
+  chime)  chime_preview ;;
   _watch) _watch "${2:?usage: _watch <logfile>}" ;;
-  *) echo "usage: hot-bag {start|stop|status|report [logfile]|doctor}" >&2; exit 2 ;;
+  _lidwatch) _lidwatch ;;
+  _indicator-state) indicator_state ;;
+  *) echo "usage: hot-bag {start|stop [--kill-stray-caffeinate]|status|report [logfile]|chime|doctor}" >&2; exit 2 ;;
 esac

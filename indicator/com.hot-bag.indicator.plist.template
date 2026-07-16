@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Template — indicator/install.sh substitutes __BIN__ / __HOTBAG__ / __POLL__
+     and writes the result to ~/Library/LaunchAgents/. Do not load this file
+     directly; the placeholders are not valid paths. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hot-bag.indicator</string>
+
+    <!-- The compiled menu-bar agent. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+    </array>
+
+    <!-- Tell the agent where the hot-bag script is, and how often to poll.
+         The agent's own PATH under launchd is minimal, so we pass it directly. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOTBAG_BIN</key>
+        <string>__HOTBAG__</string>
+        <key>HOTBAG_POLL_SECS</key>
+        <string>__POLL__</string>
+    </dict>
+
+    <!-- Start at login and keep it alive if it crashes. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- A GUI-session agent: it draws into the menu bar. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
