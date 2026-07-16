@@ -55,6 +55,11 @@ When you're back: open the lid, `hot-bag stop`, read the report.
    `~/.local/state/hot-bag/runs/` — temperature, battery, connectivity, and
    **bytes used over the tether** (so the report tells you how much phone data
    the run burned).
+4. Lights a **🔥 in the menu bar** so you can see at a glance that hot-bag is
+   holding the Mac awake. It disappears on `stop` — and removes itself if the
+   watchdog ever dies, so it can't lie about a dead run. (Built once with the
+   Xcode Command Line Tools' `swiftc`; skipped with a warning if that's not
+   installed. `MENUBAR=0` turns it off.)
 
 `stop` reverses all of it (`disablesleep 0`, kills watchdog + caffeinate) and
 prints the report.
@@ -152,6 +157,7 @@ All optional. Set as environment variables, or copy `config.example` to
 | `WIFI_SSID` / `WIFI_PASSWORD` | *(blank)* | Wi-Fi to auto-rejoin on drop |
 | `LOW_BATT_ACTION` | `none` | `sleep` = graceful sleep when low on battery |
 | `LOW_BATT_PCT` | `7` | Battery % that triggers the safety |
+| `MENUBAR` | `1` | Show 🔥 in the menu bar while a run is active (`0` = off) |
 
 ---
 

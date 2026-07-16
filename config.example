@@ -23,3 +23,8 @@
 # 'none' = just log it. Requires passwordless sudo for pmset to work unattended.
 # LOW_BATT_ACTION=none
 # LOW_BATT_PCT=7
+
+# Menu-bar flame: show 🔥 in the macOS status bar while a run is active.
+# Needs the Xcode Command Line Tools (swiftc) for a one-time build; without
+# them start warns and runs without the icon. 0 = off.
+# MENUBAR=1

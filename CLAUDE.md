@@ -77,9 +77,31 @@ Subcommands dispatched via a `case` at the bottom:
   same script so config flows in via exported env vars from `start`.
 
 State/logs live under `HOTBAG_HOME` (default `~/.local/state/hot-bag/`):
-`watchdog.pid`, `caffeinate.pid`, `current-run` (path to active CSV),
-`disablesleep.on` (SLEEP_GUARD marker), `.lock` (start/stop mutex),
-`runs/*.csv`.
+`watchdog.pid`, `caffeinate.pid`, `menubar.pid`, `current-run` (path to active
+CSV), `disablesleep.on` (SLEEP_GUARD marker), `.lock` (start/stop mutex),
+`hot-bag-menubar` (compiled 🔥 helper), `runs/*.csv`.
+
+## Menu-bar flame indicator
+
+`start` shows a 🔥 in the macOS status bar for the duration of a run; `stop`
+and `doctor` remove it. Implementation: a tiny Swift `NSStatusItem` app whose
+source is embedded in the script as a heredoc (`menubar_build`), compiled once
+with `swiftc` (Xcode CLT) to `$HOTBAG_HOME/hot-bag-menubar`, and rebuilt when
+the script is newer than the binary (`$0 -nt` — follows the install symlink to
+the real file). Invariants:
+
+- **Optional by design.** No `swiftc`, compile failure, or `MENUBAR=0` must
+  never block `start` — `menubar_start` warns and returns 0. Don't make the
+  flame load-bearing.
+- **The helper self-terminates.** It gets the watchdog pid as argv[1] and
+  polls `kill(pid, 0)` every 5s, exiting when the watchdog is gone — so a
+  crashed run can't strand a stale flame even if `stop`/`doctor` never run.
+  Don't drop that argument.
+- Kills go through `safe_ps_match` on the pidfile plus a `pkill -f
+  "$MENUBAR_BIN"` stray sweep — safe because the binary path is unique to
+  hot-bag's state dir.
+- The Swift heredoc is quoted (`<<'SWIFT'`) so `$`/backticks in Swift are
+  literal. Keep it that way.
 
 ## CSV schema
 
