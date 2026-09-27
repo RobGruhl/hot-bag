@@ -149,7 +149,7 @@ All optional. Set as environment variables, or copy `config.example` to
 |-----|---------|---------|
 | `INTERVAL` | `30` | Seconds between samples |
 | `WARN_C` / `HOT_C` / `CRIT_C` | `80` / `90` / `95` | Temp thresholds (°C) |
-| `PING_HOST` | `1.1.1.1` | Connectivity check target |
+| `PING_HOST` | `1.1.1.1` | Connectivity check target (tried first; falls back to 8.8.8.8, then an HTTP check to captive.apple.com) |
 | `WIFI_SSID` / `WIFI_PASSWORD` | *(blank)* | Wi-Fi to auto-rejoin on drop |
 | `LOW_BATT_ACTION` | `none` | `sleep` = graceful sleep when low on battery |
 | `LOW_BATT_PCT` | `7` | Battery % that triggers the safety |
