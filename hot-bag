@@ -191,14 +191,19 @@ read_power_src() { pmset -g batt 2>/dev/null | awk -F\' 'NR==1{print $2}'; }  # 
 read_net_iface() { route -n get default 2>/dev/null | awk '/interface:/{print $2}'; }
 # "Up" if ANY probe answers. A single ICMP target isn't enough: some networks
 # (corporate, guest, some carriers) drop ICMP to 1.1.1.1 but pass 8.8.8.8, or
-# block ICMP entirely while HTTP works. The HTTP probe is Apple's captive-portal
-# check, so a login page doesn't count as online (it wouldn't return "Success").
+# block ICMP entirely while HTTPS works. The fallbacks are captive-portal probes
+# over HTTPS (Apple, then Cloudflare): a login page can't forge a TLS response,
+# so it doesn't count as online. Plain HTTP is not enough. In-flight Wi-Fi
+# (e.g. Turkish Airlines/Panasonic) routes HTTP through a transparent Squid that
+# answers captive.apple.com with a 500 even when you're online. Satellite TLS
+# setup takes ~2-3s, hence the 6s budget.
 net_up() {
   local h
   for h in "$PING_HOST" 8.8.8.8; do
     ping -c1 -t2 "$h" >/dev/null 2>&1 && return 0
   done
-  curl -fsS --max-time 4 http://captive.apple.com/hotspot-detect.html 2>/dev/null | grep -q Success
+  curl -fsS --max-time 6 https://captive.apple.com/hotspot-detect.html 2>/dev/null | grep -q Success && return 0
+  [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 6 https://cp.cloudflare.com/generate_204 2>/dev/null)" = 204 ]
 }
 # Cumulative rx/tx bytes for an interface (since it came up). Echoes "rx tx".
 # Looks up the Ibytes/Obytes columns by name in the header so we don't break
