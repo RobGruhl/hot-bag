@@ -709,6 +709,9 @@ report() {
     if($12+0>0){ if(!($9 in txlo)||$12+0<txlo[$9])txlo[$9]=$12+0; if($12+0>txhi[$9])txhi[$9]=$12+0 }
   }
   END{
+    # No rows: the run stopped before the first sample landed (each takes a few
+    # seconds). Blank fields would read as 0% speed, 0% uptime, etc., so bail.
+    if(!n){ print "samples      : 0 (stopped before the first sample was written; nothing to report)"; exit }
     dur=maxe-mine; h=int(dur/3600); m=int((dur%3600)/60); s=dur%60;
     printf "samples      : %d over %dh%02dm%02ds\n", n, h, m, s;
     if(c) printf "CPU temp     : avg %.1f°C  min %.1f°C  max %.1f°C\n", cs/c, cmin, cmax;
