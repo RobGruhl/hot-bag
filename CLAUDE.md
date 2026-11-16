@@ -318,7 +318,8 @@ pmset/ps and a PTY, without sudo or actual power changes.
 ### Native GIF flock
 
 Default `screensaver` resolves the installed symlink and execs `screensaver/run.sh`.
-It compiles `main.swift` + `Flock.swift` + `Breakfast.swift` on demand with Apple's Swift compiler.
+It compiles `main.swift` + `ToastView.swift` + `Flock.swift` + `Breakfast.swift` on demand with Apple's Swift compiler.
+`ToastView.swift` (all drawing) is shared with the system screen saver bundle; `main.swift` is app-only.
 One global boids simulation feeds a borderless AppKit window per NSScreen;
 coordinates are global macOS points, not per-display pixels. Never wrap at an
 internal monitor edge or create independent simulations per window. Desktop
@@ -358,3 +359,31 @@ loose toast on departure or after 18s. All effects freeze with simulation pause.
 Generated assets/prompts are checked in under screensaver/assets. Tests cover
 travel-before-hit, single ejection, cooldown, refill, obstacle line of sight,
 pause, cleanup, bounded effects and attacks in the normal multi-monitor flock.
+
+
+### System screen saver bundle (`screensaver/saver/`)
+
+Optional, opt-in real macOS screen saver: `screensaver/saver/install.sh` builds
+`HotBag.saver` with `swiftc -emit-library -Xlinker -bundle` (MH_BUNDLE, ad-hoc
+signed, no Xcode project) and copies it to `~/Library/Screen Savers/`. This is
+the only variant that is an actual lock: macOS starts it, dismisses it on input
+and asks for the password. The script never selects the saver or changes lock
+settings; it prints the System Settings steps. No sudo.
+
+`HotBagSaverView` (`@objc` name is the plist's NSPrincipalClass; keep them in
+sync) hosts a non-interactive `ToastView` (`interactive = false`: no first
+responder, no hit testing, so Q can never terminate the system host). The
+system makes one view per display in one process; `SaverWorld.shared` owns the
+single Flock and each view reports its real global window frame every frame.
+Do not give each view its own simulation. Overlapping reported frames fall back
+to a side-by-side row. Small views (System Settings thumbnail) get a private
+flock scaled via bounds; size decides, not the unreliable `isPreview` flag.
+On `com.apple.screensaver.willstop` a full-size view calls `exit(0)`: recent
+macOS leaves the saver host animating after dismissal otherwise.
+
+Telemetry is best effort: the path to the CLI is baked into Info.plist
+(`HotBagCLI`) and read via `_screensaver-status`. The panel stays hidden until
+a read succeeds, because the system host is sandboxed and may refuse to launch
+the CLI. Whether it does on current macOS is unverified. `tests/saver.sh` loads
+the built bundle via NSBundle and renders two displays plus the thumbnail into
+offscreen bitmaps; it does not exercise the real host, sandbox or locking.

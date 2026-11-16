@@ -234,8 +234,7 @@ Tools), with no third-party runtime dependencies. The menu-bar indicator's
 prompt are in `screensaver/assets/`; ImageMagick is only needed to regenerate
 GIFs from the source sheet, using `bash screensaver/tools/build-gif.sh`.
 
-This is an opt-in graphics view, not an installed macOS system screensaver or a
-screen lock. It does not change power settings or prevent normal sleep/locking.
+The `hot-bag screensaver` command is an opt-in graphics view, not a screen lock: it draws over an unlocked session. It does not change power settings or prevent normal sleep/locking.
 The terminal fallback needs an interactive ANSI terminal and restores its TTY on exit.
 
 Safe development checks (no changes to power management):
@@ -244,7 +243,29 @@ Safe development checks (no changes to power management):
 bash -n hot-bag screensaver/run.sh
 /opt/homebrew/bin/python3 tests/screensaver.py
 bash tests/flock.sh
+bash tests/saver.sh
 ```
+
+### As a real lock screen (system screen saver)
+
+To have the flock lock the Mac, wake on mouse movement and require your login, install it as a macOS screen saver:
+
+```bash
+./screensaver/saver/install.sh             # build + install ~/Library/Screen Savers/HotBag.saver
+./screensaver/saver/install.sh uninstall   # remove it
+```
+
+Then, in System Settings:
+
+1. **Screen Saver** → choose **Hot Bag** (under Other).
+2. **Lock Screen** → "Require password after screen saver begins or display is turned off" → **Immediately**.
+3. **Lock Screen** → "Start Screen Saver when inactive", or set a hot corner under **Desktop & Dock → Hot Corners**.
+
+The installer needs no sudo and changes none of these settings for you. Things to know:
+
+- During a hot-bag run, `caffeinate` holds off the idle timer, so start the saver with a hot corner.
+- The keys (Q, Space, H, F) do not apply: any input dismisses a system screen saver.
+- The telemetry panel appears only if macOS lets the sandboxed saver host run the hot-bag CLI; otherwise the saver shows the flock alone.
 
 ## Menu-bar indicator (🔥 at a glance)
 
