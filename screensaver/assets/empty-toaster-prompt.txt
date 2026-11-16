@@ -1,0 +1,1 @@
+Edit this exact 4 by 2 sprite sheet: remove ONLY the golden bread slices sticking out of all eight toasters, revealing dark empty slots. Keep the toaster bodies, every wing pose, exact positions, sizes, padding, overall aspect ratio, pure black background, palette and pixel art style unchanged. These are the empty versions of the identical animated toasters. No other changes.

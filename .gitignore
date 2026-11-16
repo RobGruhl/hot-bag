@@ -11,3 +11,6 @@ indicator/HotBagIndicator
 .oraclerc
 .claude/
 .DS_Store
+
+# Native graphical screensaver build
+screensaver/HotBagScreensaver

@@ -882,6 +882,156 @@ indicator_state() {
   fi
 }
 
+# ── retro screensaver ──────────────────────────────────────────────────────
+# A read-only terminal view, not a macOS screen lock or power-management mode.
+# Keep the entire panel moving, including instructions; no fixed bright HUD.
+# This command owns the foreground process; exits always restore its TTY.
+# Shared, read-only cached telemetry for the native and terminal views.
+screensaver_status() {
+  local state label sample age logfile last epoch iso cpu gpu thermal limit battery power iface net rx tx extra now seconds
+  state="$(indicator_state 2>/dev/null)" || state="unknown"
+  case "$state" in
+    on) label="RUN ACTIVE / cached telemetry" ;;
+    wedged) label="WEDGED! Exit and run hot-bag doctor" ;;
+    off) label="RUN OFF / preview only" ;;
+    *) label="Run state unavailable" ;;
+  esac
+  sample="No complete telemetry sample yet"; age=""
+  if [ "$state" = on ] && [ -f "$CURRENT_RUN" ]; then
+    logfile="$(cat "$CURRENT_RUN" 2>/dev/null)" || logfile=""
+    if [ -f "$logfile" ]; then
+      # A watchdog write can be partial: only accept complete schema rows.
+      last="$(tail -n 3 "$logfile" 2>/dev/null | awk -F, 'NF==12 && $1 ~ /^[0-9]+$/ {row=$0} END {print row}')" || last=""
+      IFS=, read -r epoch iso cpu gpu thermal limit battery power iface net rx tx extra <<< "$last"
+      if [[ "$epoch" =~ ^[0-9]{1,12}$ ]] &&
+         [[ "$cpu" =~ ^(NA|[0-9]+([.][0-9]+)?)$ ]] &&
+         [[ "$gpu" =~ ^(NA|[0-9]+([.][0-9]+)?)$ ]] &&
+         [[ "$battery" =~ ^(NA|[0-9]+)$ ]] &&
+         [[ "$thermal" =~ ^(OK|WARM|HOT|CRITICAL|THROTTLED|UNKNOWN)$ ]] &&
+         [[ "$net" =~ ^(up|down)$ ]]; then
+        # Allow only known tokens/numbers onto the terminal: never replay
+        # arbitrary CSV text (e.g. an interface name containing ANSI).
+        sample="CPU ${cpu}C GPU ${gpu}C BATT ${battery}%"
+        now="$(date +%s)"
+        seconds=$((now - 10#$epoch))
+        if [ "$seconds" -lt 0 ]; then
+          age="Sample clock is ahead / NET $net"
+        else
+          age="$thermal / NET $net / sample ${seconds}s old"
+        fi
+      fi
+    fi
+  fi
+  printf '%s\n' "$label" "$sample" "$age"
+}
+
+# Resolve the installed symlink so assets stay beside the repository script.
+screensaver_graphics() {
+  if [ "$#" -gt 1 ]; then
+    err "usage: hot-bag screensaver [--terminal|--windowed]"
+    exit 2
+  fi
+  local source="${BASH_SOURCE[0]}" directory
+  while [ -L "$source" ]; do
+    directory="$(cd -P "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" = /* ]] || source="$directory/$source"
+  done
+  directory="$(cd -P "$(dirname "$source")" && pwd)"
+  exec /bin/bash "$directory/screensaver/run.sh" "$@"
+}
+
+screensaver() {
+  if [ "$#" -ne 0 ]; then
+    err "usage: hot-bag screensaver"
+    exit 2
+  fi
+  if [ ! -t 0 ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = dumb ]; then
+    err "screensaver needs an interactive ANSI terminal (not redirected output)."
+    exit 2
+  fi
+  saved_tty=""
+  saved_tty="$(stty -g)" || exit 1
+  cleanup_screensaver() {
+    stty "$saved_tty" 2>/dev/null || true
+    printf '\033[0m\033[?25h\033[?1049l'
+  }
+  trap cleanup_screensaver EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  # Job control must not strand the terminal in no-echo mode.
+  trap 'exit 0' TSTP
+  stty -echo -icanon min 1 time 0
+  printf '\033[?1049h\033[?25l\033[0m\033[40m\033[2J'
+
+  local x=1 y=1 dx=1 dy=1 frame=0 rows=24 cols=80 key=""
+  local width=48 height=14 max_x max_y i color=36 size state="UNKNOWN"
+  local logfile="" last="" epoch="" iso="" cpu="" gpu="" thermal=""
+  local limit="" battery="" power="" iface="" net="" rx="" tx="" extra=""
+  local sample="No complete telemetry sample yet"
+  local label="State unavailable" age="" now="" seconds=""
+  local panel=()
+  while :; do
+    size="$(stty size 2>/dev/null)" || size="24 80"
+    read -r rows cols <<< "$size"
+    case "$rows:$cols" in *[!0-9:]*|:*) rows=24; cols=80 ;; esac
+    # Refresh truth every five seconds, not every animation step. This never
+    # calls start/stop, sudo, caffeinate, sensors or a connectivity probe.
+    if [ $((frame % 5)) -eq 0 ]; then
+      { IFS= read -r label; IFS= read -r sample; IFS= read -r age; } < <(screensaver_status)
+    fi
+    # Original ASCII flying toaster; alternating wings stay with the moving
+    # panel, so even instructions and telemetry never form a fixed HUD.
+    local wing_left wing_right
+    if [ $((frame % 2)) -eq 0 ]; then
+      wing_left=" __/ /"; wing_right="\\ \\__"
+    else
+      wing_left=" \\__\\"; wing_right="/__ /"
+    fi
+    panel=("       F L Y I N G   T O A S T E R"
+           "                _===_  _===_"
+           "              .------------- ."
+           "    $wing_left    |  [---] [---] |    $wing_right"
+           "   <======    |    HOT BAG   |    ======>"
+           "              |          o  |"
+           "              '-------------'"
+           "                  oo     oo"
+           "  $label"
+           "  $sample"
+           "  $age"
+           "  .   *   .      +       .    *       ."
+           "  q / Esc: exit view (run keeps going)"
+           "  Not a screen lock. Sleep settings unchanged.")
+    max_x=$((cols-width)); max_y=$((rows-height))
+    # Never wrap at the last column, including small/resized terminal windows.
+    [ "$max_x" -ge 1 ] || max_x=1
+    [ "$max_y" -ge 1 ] || max_y=1
+    [ "$x" -le "$max_x" ] || x=$max_x
+    [ "$y" -le "$max_y" ] || y=$max_y
+    printf '\033[40m\033[2J\033[2;%sm' "$color"
+    i=0
+    for last in "${panel[@]}"; do
+      [ $((y+i)) -lt "$rows" ] || break
+      printf '\033[%s;%sH%.*s' "$((y+i))" "$x" "$((cols-x))" "$last"
+      i=$((i+1))
+    done
+    # bash 3.2 compatible timed read; failure just means no key this frame.
+    key=""
+    IFS= read -r -s -n 1 -t 1 key || true
+    case "$key" in q|Q|$'\033') break ;; esac
+    # Other keypresses do not accelerate/redraw the animation in a tight loop.
+    [ -z "$key" ] || sleep 1
+    x=$((x+dx)); y=$((y+dy))
+    if [ "$x" -ge "$max_x" ]; then x=$max_x; dx=-1; color=$((31+RANDOM%6)); fi
+    if [ "$x" -le 1 ]; then x=1; dx=1; fi
+    if [ "$y" -ge "$max_y" ]; then y=$max_y; dy=-1; fi
+    if [ "$y" -le 1 ]; then y=1; dy=1; fi
+    frame=$((frame+1))
+  done
+  exit 0
+}
+
 case "${1:-}" in
   start)  start ;;
   stop)   shift; stop "$@" ;;
@@ -889,8 +1039,16 @@ case "${1:-}" in
   report) report "${2:-}" ;;
   doctor) doctor ;;
   chime)  chime_preview ;;
+  screensaver)
+    shift
+    case "${1:-}" in
+      --terminal) shift; screensaver "$@" ;;
+      ""|--windowed) screensaver_graphics "$@" ;;
+      *) err "usage: hot-bag screensaver [--terminal|--windowed]"; exit 2 ;;
+    esac ;;
+  _screensaver-status) screensaver_status ;;
   _watch) _watch "${2:?usage: _watch <logfile>}" ;;
   _lidwatch) _lidwatch ;;
   _indicator-state) indicator_state ;;
-  *) echo "usage: hot-bag {start|stop [--kill-stray-caffeinate]|status|report [logfile]|chime|doctor}" >&2; exit 2 ;;
+  *) echo "usage: hot-bag {start|stop [--kill-stray-caffeinate]|status|report [logfile]|chime|screensaver|doctor}" >&2; exit 2 ;;
 esac

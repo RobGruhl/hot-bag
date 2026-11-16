@@ -89,6 +89,7 @@ final class Indicator: NSObject {
         menu.addItem(header)
         menu.addItem(.separator())
         menu.addItem(withTitle: "Status…", action: #selector(openStatus), keyEquivalent: "s").target = self
+        menu.addItem(withTitle: "Run retro screensaver…", action: #selector(runScreensaver), keyEquivalent: "r").target = self
         menu.addItem(withTitle: "Run doctor (recover)", action: #selector(runDoctor), keyEquivalent: "d").target = self
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit indicator", action: #selector(quit), keyEquivalent: "q").target = self
@@ -138,6 +139,7 @@ final class Indicator: NSObject {
     func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
     @objc func openStatus() { runInTerminal("status") }
+    @objc func runScreensaver() { runInTerminal("screensaver") }
     @objc func runDoctor()  { runInTerminal("doctor") }
     @objc func quit()       { NSApplication.shared.terminate(nil) }
 }

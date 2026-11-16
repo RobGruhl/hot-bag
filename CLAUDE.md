@@ -300,3 +300,61 @@ non-interactive context — the password prompt will hang.
   tear down on stop (flush anchor + `dnctl -q flush`), with a trap so a crash
   doesn't strand a half-applied ruleset and drop the user's connection. Until
   then, the documented data-limiting answer is Low Data Mode (Wi-Fi tether only).
+
+
+## Retro screensaver view
+
+`screensaver --terminal` is a foreground, read-only ANSI terminal animation. Keep all
+content moving (no fixed HUD), capped at 1 fps. It never calls start/stop or
+changes power/security settings. Reuses `indicator_state` every five frames;
+only displays a complete cached CSV row with numeric/allowlisted fields so
+untrusted text cannot inject terminal controls. Shows sample age, missing-data
+and wedged states honestly. EXIT/INT/TERM/HUP/TSTP restore stty, cursor, and
+alternate screen. Do not move the function into a subshell: a signal sent to
+the CLI PID must reach its cleanup traps. `tests/screensaver.py` uses mock
+pmset/ps and a PTY, without sudo or actual power changes.
+
+
+### Native GIF flock
+
+Default `screensaver` resolves the installed symlink and execs `screensaver/run.sh`.
+It compiles `main.swift` + `Flock.swift` + `Breakfast.swift` on demand with Apple's Swift compiler.
+One global boids simulation feeds a borderless AppKit window per NSScreen;
+coordinates are global macOS points, not per-display pixels. Never wrap at an
+internal monitor edge or create independent simulations per window. Desktop
+topology uses actual screen rectangles and shared-edge portals, not a bounding
+rectangle as navigable space. Exposed edges steer/bounce; there is no wrap. Screen-change
+notifications rebuild windows and update world bounds. `--windowed` is a preview.
+Q/Esc closes all views; Space pauses; H toggles the moving status; F changes mode.
+No sleep assertions, sudo, sensor or network probes. `_screensaver-status` shares
+the validated cached telemetry formatter with the terminal fallback. Rendering
+runs at 30fps, GIF playback at 10fps, telemetry at 5s on a background queue.
+Assets are shipped; generation tools are development-only dependencies.
+
+The butter dragon alternates 11-second pursuit and 7-second rest phases; local
+predator avoidance temporarily suppresses cohesion and adds lateral splitting.
+HUD bounds are computed for the next simulation time in global coordinates before
+stepping. Predictive steering and padded collision resolution apply to both species.
+Rendering and collision use the same statusRect method. Screen origins come from
+actual window/view conversion after placement. `--verify-layout` on the native
+binary checks real window content frames against NSScreen and exits immediately.
+`tests/flock.sh` uses preconditions (active with Swift -O), including Rob's actual
+stacked three-display geometry, moving HUD collision, chase response and roaming.
+
+
+### Butter breath and toast lifecycle
+
+`Breakfast.swift` extends Flock with a simulation-time breath/ejection lifecycle.
+Within 235pt, an available dragon attacks a loaded toaster with a clear HUD-free
+path. The breath travels for 0.38s, then rechecks distance/line of sight before
+one hit. A hit sets per-Bird toastReadyAt/poppedAt, emits one FlyingToast and 15
+crumbs, and adds recoil. Empty toasters keep their position in the birds array;
+indices remain stable for the active breath. Refill takes 8–11 seconds; renderer
+fades loaded frames over matching empty frames in the final 0.7s. Global breath
+cooldown is 3.2s. Targets prefer nearby loaded toasters.
+Flying toast uses global coordinates and exits rather than bouncing at monitors;
+HUD avoidance remains active. Crumbs expire in at most 1.08s, breath in 0.85s,
+loose toast on departure or after 18s. All effects freeze with simulation pause.
+Generated assets/prompts are checked in under screensaver/assets. Tests cover
+travel-before-hit, single ejection, cooldown, refill, obstacle line of sight,
+pause, cleanup, bounded effects and attacks in the normal multi-monitor flock.

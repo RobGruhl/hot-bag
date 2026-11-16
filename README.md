@@ -24,6 +24,7 @@ hot-bag start     # before you close the lid
 hot-bag status    # live reading, anytime (no sudo); shows data-used-so-far mid-run
 hot-bag stop      # when the job's done — prints the run report
 hot-bag report    # reprint the report for the latest run
+hot-bag screensaver # flying GIF flock on all displays; q/Esc exits
 hot-bag chime     # preview the 8-bit lid-close reminder sound
 hot-bag doctor    # detect-and-repair a wedged state (see "If things get wedged")
 ```
@@ -194,6 +195,57 @@ reminder even if you'd muted for a meeting, without leaving your Mac unmuted
 afterward. Set `LID_CHIME_UNMUTE=off` to respect the mute completely (the beep
 fires silently).
 
+## Retro flying-toaster screensaver
+
+```bash
+hot-bag screensaver              # animated GIF flock across every connected display
+hot-bag screensaver --windowed   # single-window preview
+hot-bag screensaver --terminal   # original ASCII fallback
+```
+
+Original AI-generated chrome toasters flap their feathered wings through a dark
+starfield. A tiny animated butter dragon alternates playful pursuit with circling
+breaks. Toasters split, accelerate, bank away and regroup; their small neighbor
+groups and individual wandering keep the flock from collapsing into one blob.
+When the dragon gets close, it breathes a little stream of golden butter. A hit
+pops the toast out with crumbs, a wobble and a tiny “pop!”; the buttered slice
+somersaults away across display edges and flies offscreen. The empty toaster
+keeps flocking and refills after 8–11 seconds. The dragon prefers loaded toasters
+and takes a breather between attacks. Space pauses the whole sequence.
+Both the toasters and dragon avoid the moving status panel, including the full
+sprite footprint. Butter breath cannot shoot through it; loose toast avoids it too.
+
+All monitors view one simulation in macOS global **points**. Screen windows use
+their actual content origins and configured display frames. Travel routes cross
+shared screen edges, including stacked or staggered arrangements; exposed outer
+edges turn the flock back instead of wrapping through invisible bounding-box
+corners. Display islands with no shared edge remain separate. Connecting,
+disconnecting or rearranging monitors updates the routes and windows automatically.
+
+**Q / Escape** exits all views, **Space** pauses the flock, **H** hides the status
+panel, and **F** switches between all displays and the windowed preview. The view
+runs at 30 fps, decodes its eight-frame GIF once, and reads cached telemetry every
+five seconds. The status panel drifts on the primary display; it reports inactive,
+missing-data and wedged states and the sample age. Exiting leaves your run running.
+
+The native view builds on first launch with Apple's `swiftc` (Xcode Command Line
+Tools), with no third-party runtime dependencies. The menu-bar indicator's
+**Run retro screensaver…** action opens it too. The shipped GIFs and generation
+prompt are in `screensaver/assets/`; ImageMagick is only needed to regenerate
+GIFs from the source sheet, using `bash screensaver/tools/build-gif.sh`.
+
+This is an opt-in graphics view, not an installed macOS system screensaver or a
+screen lock. It does not change power settings or prevent normal sleep/locking.
+The terminal fallback needs an interactive ANSI terminal and restores its TTY on exit.
+
+Safe development checks (no changes to power management):
+
+```bash
+bash -n hot-bag screensaver/run.sh
+/opt/homebrew/bin/python3 tests/screensaver.py
+bash tests/flock.sh
+```
+
 ## Menu-bar indicator (🔥 at a glance)
 
 Want to know at a glance whether hot-bag is on? Install the optional menu-bar
@@ -290,3 +342,5 @@ checks `ps` before killing PIDs from the pidfiles, and it only flips
 `disablesleep` back to 0 if the `SLEEP_GUARD` marker confirms hot-bag set it
 (otherwise it warns and leaves the system alone, so it won't clobber a
 `disablesleep` someone set deliberately outside hot-bag).
+
+The graphics view uses original artwork generated with the built-in image generator.
