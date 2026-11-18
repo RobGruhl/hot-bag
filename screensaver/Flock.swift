@@ -23,6 +23,15 @@ struct Bird {
 struct Desktop {
     var screens: [CGRect]
     var bounds: CGRect { screens.dropFirst().reduce(screens[0]) { $0.union($1) } }
+    // Window frames reported by the system screen saver host, as AppKit rects.
+    // The host uses Quartz coordinates (origin at the primary display's top-left,
+    // y down). When flipping every frame about the primary display lands each on
+    // a real screen, that is what they were; anything else passes through.
+    static func hostFrames(_ reported: [CGRect], screens: [CGRect]) -> [CGRect] {
+        guard let primary = screens.first else { return reported }
+        let flipped = reported.map { CGRect(x: $0.minX, y: primary.maxY-$0.maxY, width: $0.width, height: $0.height) }
+        return flipped.allSatisfy { screens.contains($0) } ? flipped : reported
+    }
     func contains(_ p: Vector) -> Bool { screens.contains { $0.contains(p.point) } }
     func nearest(_ p: Vector) -> Vector {
         screens.map { r in Vector(x: min(r.maxX-1, max(r.minX+1, p.x)), y: min(r.maxY-1, max(r.minY+1, p.y))) }

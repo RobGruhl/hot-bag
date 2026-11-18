@@ -1,5 +1,6 @@
 import Cocoa
 import ScreenSaver
+import os.log
 
 // The macOS system screen saver target. The system owns everything that makes
 // this a real lock: starting on idle or a hot corner, dismissing on mouse or
@@ -34,10 +35,18 @@ final class SaverWorld {
         if !members.isEmpty { layout() }
     }
     private func layout() {
-        var rects = members.map { $0.reported }
-        // The host normally gives each display's window its real global frame.
-        // If it ever reports overlapping frames, fall back to a side-by-side
-        // row so the flock still has distinct screens to roam.
+        let reported = members.map { $0.reported }
+        // The host renders each display remotely and reports its window frames
+        // in Quartz coordinates (y down from the primary display's top edge),
+        // not AppKit's. Taken literally, a monitor above the laptop lands below it.
+        var rects = Desktop.hostFrames(reported, screens: NSScreen.screens.map { $0.frame })
+        // NSLog is redacted in the sandboxed host; this line is the only way to
+        // see what it reported. Logged on layout changes only.
+        os_log("HotBag layout reported=%{public}@ resolved=%{public}@",
+               reported.map { NSStringFromRect($0) }.joined(separator: " "),
+               rects.map { NSStringFromRect($0) }.joined(separator: " "))
+        // If the frames still overlap (matching no real screen), fall back to a
+        // side-by-side row so the flock still has distinct screens to roam.
         let overlapping = rects.indices.contains { i in
             rects.indices.contains { j in j > i && rects[i].intersects(rects[j]) }
         }

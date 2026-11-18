@@ -13,6 +13,16 @@ let desktop = Desktop(screens:screens)
 check(desktop.portal(0,1)!.x == 368.5,"Left upper seam must use overlap")
 check(desktop.portal(0,2)!.x == 1124.5,"Right upper seam must use overlap")
 check(desktop.portal(1,2)!.x == 737,"Upper side-by-side seam")
+// What the system saver host reported for that layout (macOS 27.2): Quartz
+// coordinates, y down, so the upper monitors arrive at negative y.
+let hosted = [CGRect(x:737,y:-1440,width:2560,height:1440),CGRect(x:-1823,y:-1440,width:2560,height:1440),CGRect(x:0,y:0,width:1512,height:982)]
+let resolved = Desktop.hostFrames(hosted,screens:screens)
+check(resolved == [screens[2],screens[1],screens[0]],"Host frames resolve to the real screens")
+check(resolved[0].minY == resolved[2].maxY,"Upper monitor sits above the laptop, not below")
+check(Desktop.hostFrames(Array(hosted.prefix(1)),screens:screens) == [screens[2]],"Resolve while views are still arriving")
+check(Desktop.hostFrames(screens,screens:screens) == screens,"True AppKit frames pass through")
+let strangers = [CGRect(x:0,y:0,width:800,height:600),CGRect(x:800,y:0,width:800,height:600)]
+check(Desktop.hostFrames(strangers,screens:screens) == strangers,"Frames matching no screen pass through")
 let flock = Flock(screens:screens)
 flock.antagonistEnabled = false
 flock.birds = [Bird(position:Vector(x:400,y:981),velocity:Vector(x:0,y:100),size:100,phase:0)]
@@ -83,7 +93,7 @@ breakfast.obstacles=[CGRect(x:950,y:600,width:100,height:400)]
 check(!breakfast.clearButterPath(from:Vector(x:900,y:800),to:Vector(x:1100,y:800)),"Butter cannot pass through HUD")
 check(live.popCount>0,"Normal flock simulation produces butter attacks")
 check(live.flyingToast.count<=6 && live.crumbs.count<=30,"Transient effect storage remains bounded")
-print("PASS: 3-screen topology, crossings, HUD avoidance, 400-second roaming, hot unplug; butter breath travel, one-hit ejection, crumbs, pause, refill, offscreen cleanup and bounded effects")
+print("PASS: 3-screen topology, saver host frames, crossings, HUD avoidance, 400-second roaming, hot unplug; butter breath travel, one-hit ejection, crumbs, pause, refill, offscreen cleanup and bounded effects")
 SWIFT
 # precondition remains active with -O (plain Swift assert does not).
 swiftc -O -module-cache-path "$TMP/cache" "$ROOT/screensaver/Flock.swift" "$ROOT/screensaver/Breakfast.swift" "$TMP/main.swift" -o "$TMP/check"

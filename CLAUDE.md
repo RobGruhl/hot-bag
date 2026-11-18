@@ -374,7 +374,15 @@ settings; it prints the System Settings steps. No sudo.
 sync) hosts a non-interactive `ToastView` (`interactive = false`: no first
 responder, no hit testing, so Q can never terminate the system host). The
 system makes one view per display in one process; `SaverWorld.shared` owns the
-single Flock and each view reports its real global window frame every frame.
+single Flock and each view reports its window frame every frame. The host
+renders displays remotely and reports those frames in **Quartz** coordinates
+(y down from the primary display's top edge; verified on macOS 27.2, where
+`window.screen` is also nil off the primary). `Desktop.hostFrames` flips them
+to AppKit when every flipped frame lands on a real NSScreen; do not feed the
+raw frames to the flock or monitors above the laptop end up below it. NSLog is
+redacted in the host, so `layout()` logs reported/resolved frames with a public
+`os_log` (`log show --predicate 'process == "legacyScreenSaver" AND
+eventMessage CONTAINS "HotBag layout"'`).
 Do not give each view its own simulation. Overlapping reported frames fall back
 to a side-by-side row. Small views (System Settings thumbnail) get a private
 flock scaled via bounds; size decides, not the unreliable `isPreview` flag.
